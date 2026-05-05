@@ -1,0 +1,134 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "prefs": {
+          "type": "object",
+          "properties": {
+            "emailOnPayment": { "type": "boolean" },
+            "emailOnDebtReminder": { "type": "boolean" },
+            "emailOnAddedToGroup": { "type": "boolean" },
+            "emailOnAddedAsFriend": { "type": "boolean" },
+            "emailOnMonthlyReport": { "type": "boolean" }
+          }
+        }
+      },
+      "required": ["uid", "name", "email"]
+    },
+    "Friend": {
+      "title": "Friend",
+      "description": "Friend contact information",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "phone": { "type": "string" },
+        "email": { "type": "string" },
+        "addedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name"]
+    },
+    "Group": {
+      "title": "Group",
+      "description": "Expense group metadata",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "emoji": { "type": "string" },
+        "members": { "type": "array", "items": { "type": "string" } },
+        "memberUids": { "type": "array", "items": { "type": "string" } },
+        "memberDetails": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "phone": { "type": "string" },
+              "email": { "type": "string" }
+            }
+          }
+        },
+        "leader": { "type": "string" },
+        "inviteCode": { "type": "string" },
+        "dueDate": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string" }
+      },
+      "required": ["name", "emoji", "members", "leader", "inviteCode", "createdBy"]
+    },
+    "Expense": {
+      "title": "Expense",
+      "description": "A single expense entry",
+      "type": "object",
+      "properties": {
+        "desc": { "type": "string" },
+        "amount": { "type": "number" },
+        "payers": { "type": "object", "additionalProperties": { "type": "number" } },
+        "splitMode": { "type": "string" },
+        "splits": { "type": "object", "additionalProperties": { "type": "number" } },
+        "ts": { "type": "number" },
+        "createdBy": { "type": "string" }
+      },
+      "required": ["desc", "amount", "payers", "splitMode", "splits", "ts", "createdBy"]
+    },
+    "Payment": {
+      "title": "Payment",
+      "description": "A settlement payment between members",
+      "type": "object",
+      "properties": {
+        "from": { "type": "string" },
+        "to": { "type": "string" },
+        "amount": { "type": "number" },
+        "note": { "type": "string" },
+        "ts": { "type": "number" },
+        "createdBy": { "type": "string" }
+      },
+      "required": ["from", "to", "amount", "ts", "createdBy"]
+    },
+    "FeedItem": {
+      "title": "FeedItem",
+      "description": "An activity log item",
+      "type": "object",
+      "properties": {
+        "type": { "type": "string" },
+        "text": { "type": "string" },
+        "ts": { "type": "number" },
+        "icon": { "type": "string" },
+        "name": { "type": "string" }
+      },
+      "required": ["type", "text", "ts"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile"
+    },
+    "/users/{userId}/friends/{friendId}": {
+      "schema": "Friend",
+      "description": "Friend list of a user"
+    },
+    "/groups/{groupId}": {
+      "schema": "Group",
+      "description": "Group metadata"
+    },
+    "/groups/{groupId}/expenses/{expenseId}": {
+      "schema": "Expense",
+      "description": "Expenses in a group"
+    },
+    "/groups/{groupId}/payments/{paymentId}": {
+      "schema": "Payment",
+      "description": "Payments in a group"
+    },
+    "/groups/{groupId}/feed/{feedId}": {
+      "schema": "FeedItem",
+      "description": "Activity feed of a group"
+    }
+  }
+}

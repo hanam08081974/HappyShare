@@ -1,0 +1,128 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ─── HELPERS ───────────────────────────────────────────────
+    function isSignedIn() { return request.auth != null; }
+    function isVerified() { return isSignedIn() && request.auth.token.email_verified == true; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    
+    // Group membership check
+    function isMemberOfGroup(groupId) {
+      return isSignedIn() && isValidId(groupId) && request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.memberUids;
+    }
+
+    // ─── ENTITY VALIDATORS ──────────────────────────────────────
+    
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'name', 'email', 'createdAt', 'prefs'])
+        && data.keys().size() >= 5
+        && data.uid == request.auth.uid
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+        && data.email is string && data.email.size() > 0 && data.email.size() <= 100;
+    }
+
+    function isValidFriend(data) {
+      return data.keys().hasAll(['name'])
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+        && (!('phone' in data) || (data.phone is string && data.phone.size() <= 20))
+        && (!('email' in data) || (data.email is string && data.email.size() <= 100));
+    }
+
+    function isValidGroup(data) {
+      return data.keys().hasAll(['name', 'emoji', 'members', 'memberUids', 'leader', 'inviteCode', 'createdBy', 'createdAt'])
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+        && data.emoji is string && data.emoji.size() <= 10
+        && data.members is list && data.members.size() <= 50
+        && data.memberUids is list && data.memberUids.size() <= 50
+        && (!('memberDetails' in data) || data.memberDetails is map)
+        && data.leader is string && data.inviteCode is string
+        && data.createdBy == request.auth.uid;
+    }
+
+    function isValidExpense(data) {
+        return data.keys().hasAll(['desc', 'amount', 'payers', 'splitMode', 'splits', 'ts', 'createdBy'])
+            && data.desc is string && data.desc.size() > 0 && data.desc.size() <= 200
+            && data.amount is number && data.amount > 0
+            && data.payers is map && data.splits is map
+            && data.splitMode in ['equal', 'percent', 'adjust']
+            && data.createdBy == request.auth.uid;
+    }
+
+    function isValidPayment(data) {
+        return data.keys().hasAll(['from', 'to', 'amount', 'ts', 'createdBy'])
+            && data.from is string && data.to is string
+            && data.amount is number && data.amount > 0
+            && data.createdBy == request.auth.uid;
+    }
+
+    function isValidFeedItem(data) {
+        return data.keys().hasAll(['type', 'text', 'ts'])
+            && data.type is string && data.text is string
+            && data.ts is number;
+    }
+
+    // ─── MATCH BLOCKS ───────────────────────────────────────────
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isVerified() && request.auth.uid == userId && isValidUser(incoming());
+      allow update: if isVerified() && request.auth.uid == userId && isValidUser(incoming())
+                       && incoming().uid == existing().uid // Immutable UID
+                       && (
+                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'photoURL', 'prefs'])
+                       );
+      
+      match /friends/{friendId} {
+        allow list, get: if isSignedIn() && request.auth.uid == userId;
+        allow create: if isVerified() && request.auth.uid == userId && isValidFriend(incoming());
+        allow update: if isVerified() && request.auth.uid == userId && isValidFriend(incoming());
+        allow delete: if isVerified() && request.auth.uid == userId;
+      }
+    }
+
+    match /groups/{groupId} {
+      allow list: if isSignedIn() && request.auth.uid in resource.data.memberUids;
+      allow get: if isSignedIn() && (request.auth.uid in resource.data.memberUids || resource.data.inviteCode == request.query.inviteCode);
+      
+      allow create: if isVerified() && isValidGroup(incoming()) && request.auth.uid in incoming().memberUids;
+      
+      allow update: if isVerified() && isMemberOfGroup(groupId) && isValidGroup(incoming())
+        && (
+          // Action: Edit metadata
+          (incoming().diff(existing()).affectedKeys().hasOnly(['name', 'emoji', 'dueDate'])) ||
+          // Action: Manage members
+          (incoming().diff(existing()).affectedKeys().hasOnly(['members', 'memberUids'])) ||
+          // Admin override
+          (existing().leader == request.auth.uid)
+        );
+      
+      allow delete: if isVerified() && existing().leader == request.auth.uid;
+
+      match /expenses/{expenseId} {
+        allow list, get: if isMemberOfGroup(groupId);
+        allow create: if isVerified() && isMemberOfGroup(groupId) && isValidExpense(incoming());
+        allow update: if isVerified() && isMemberOfGroup(groupId) && isValidExpense(incoming()) && incoming().createdBy == existing().createdBy;
+        allow delete: if isVerified() && isMemberOfGroup(groupId) && (existing().createdBy == request.auth.uid || get(/databases/$(database)/documents/groups/$(groupId)).data.leader == request.auth.uid);
+      }
+
+      match /payments/{paymentId} {
+        allow list, get: if isMemberOfGroup(groupId);
+        allow create: if isVerified() && isMemberOfGroup(groupId) && isValidPayment(incoming());
+        allow update: if isVerified() && isMemberOfGroup(groupId) && isValidPayment(incoming()) && incoming().createdBy == existing().createdBy;
+        allow delete: if isVerified() && isMemberOfGroup(groupId) && (existing().createdBy == request.auth.uid || get(/databases/$(database)/documents/groups/$(groupId)).data.leader == request.auth.uid);
+      }
+
+      match /feed/{feedId} {
+        allow list, get: if isMemberOfGroup(groupId);
+        allow create: if isVerified() && isMemberOfGroup(groupId) && isValidFeedItem(incoming());
+      }
+    }
+  }
+}
