@@ -15,51 +15,58 @@ service cloud.firestore {
     
     // Group membership check
     function isMemberOfGroup(groupId) {
-      return isSignedIn() && isValidId(groupId) && request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.memberUids;
+      return isSignedIn() && (request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.memberUids);
     }
 
     // ─── ENTITY VALIDATORS ──────────────────────────────────────
     
     function isValidUser(data) {
-      return data.keys().hasAll(['uid', 'name', 'email', 'createdAt', 'prefs'])
-        && data.keys().size() >= 5
-        && data.uid == request.auth.uid
-        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
-        && data.email is string && data.email.size() > 0 && data.email.size() <= 100;
+      return (request.method == 'create' ? (data.keys().hasAll(['uid', 'name', 'email', 'createdAt', 'prefs']) && data.uid == request.auth.uid) : true)
+        && (!('name' in data) || (data.name is string && data.name.size() > 0 && data.name.size() <= 100))
+        && (!('email' in data) || (data.email is string && data.email.size() > 0 && data.email.size() <= 100))
+        && (!('avatar' in data) || data.avatar is string);
     }
 
     function isValidFriend(data) {
-      return data.keys().hasAll(['name'])
-        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+      return (!('name' in data) || (data.name is string && data.name.size() > 0 && data.name.size() <= 100))
         && (!('phone' in data) || (data.phone is string && data.phone.size() <= 20))
         && (!('email' in data) || (data.email is string && data.email.size() <= 100));
     }
 
     function isValidGroup(data) {
-      return data.keys().hasAll(['name', 'emoji', 'members', 'memberUids', 'leader', 'inviteCode', 'createdBy', 'createdAt'])
-        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
-        && data.emoji is string && data.emoji.size() <= 10
-        && data.members is list && data.members.size() <= 50
-        && data.memberUids is list && data.memberUids.size() <= 50
-        && (!('memberDetails' in data) || data.memberDetails is map)
-        && data.leader is string && data.inviteCode is string
-        && data.createdBy == request.auth.uid;
+      return (request.method == 'create' ? (data.keys().hasAll(['name', 'emoji', 'members', 'memberUids', 'leader', 'leaderUid', 'inviteCode', 'createdBy', 'createdAt']) && data.createdBy == request.auth.uid) : true)
+        && (!('name' in data) || (data.name is string && data.name.size() > 0 && data.name.size() <= 100))
+        && (!('emoji' in data) || data.emoji is string)
+        && (!('members' in data) || data.members is list)
+        && (!('memberUids' in data) || data.memberUids is list)
+        && (!('leader' in data) || data.leader is string)
+        && (!('leaderUid' in data) || data.leaderUid is string)
+        && (!('inviteCode' in data) || data.inviteCode is string);
+    }
+
+    function isValidInvitation(data) {
+      return (request.method == 'create' ? data.keys().hasAll(['groupId', 'inviterName', 'email', 'ts']) : true)
+        && (!('groupId' in data) || data.groupId is string)
+        && (!('inviterName' in data) || data.inviterName is string)
+        && (!('email' in data) || data.email is string)
+        && (!('ts' in data) || data.ts is number);
     }
 
     function isValidExpense(data) {
-        return data.keys().hasAll(['desc', 'amount', 'payers', 'splitMode', 'splits', 'ts', 'createdBy'])
-            && data.desc is string && data.desc.size() > 0 && data.desc.size() <= 200
-            && data.amount is number && data.amount > 0
-            && data.payers is map && data.splits is map
-            && data.splitMode in ['equal', 'percent', 'adjust']
-            && data.createdBy == request.auth.uid;
+        return (request.method == 'create' ? (data.keys().hasAll(['desc', 'amount', 'payers', 'splitMode', 'splits', 'ts', 'createdBy']) && data.createdBy == request.auth.uid) : true)
+            && (!('desc' in data) || (data.desc is string && data.desc.size() > 0 && data.desc.size() <= 200))
+            && (!('amount' in data) || (data.amount is number && data.amount > 0))
+            && (!('payers' in data) || data.payers is map)
+            && (!('splits' in data) || data.splits is map)
+            && (!('splitMode' in data) || (data.splitMode in ['equal', 'percent', 'adjust', 'itemized']))
+            && (!('memberDetails' in data) || data.memberDetails is map);
     }
 
     function isValidPayment(data) {
-        return data.keys().hasAll(['from', 'to', 'amount', 'ts', 'createdBy'])
-            && data.from is string && data.to is string
-            && data.amount is number && data.amount > 0
-            && data.createdBy == request.auth.uid;
+        return (request.method == 'create' ? (data.keys().hasAll(['from', 'to', 'amount', 'ts', 'createdBy']) && data.createdBy == request.auth.uid) : true)
+            && (!('from' in data) || data.from is string)
+            && (!('to' in data) || data.to is string)
+            && (!('amount' in data) || (data.amount is number && data.amount > 0));
     }
 
     function isValidFeedItem(data) {
@@ -87,36 +94,45 @@ service cloud.firestore {
       }
     }
 
+    match /invitations/{inviteId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn() && (resource.data.email == request.auth.token.email);
+      allow create: if isVerified() && isMemberOfGroup(incoming().groupId) && isValidInvitation(incoming());
+      allow delete: if isVerified() && (isMemberOfGroup(existing().groupId) || request.auth.uid in get(/databases/$(database)/documents/groups/$(existing().groupId)).data.memberUids);
+    }
+
     match /groups/{groupId} {
       allow list: if isSignedIn() && request.auth.uid in resource.data.memberUids;
-      allow get: if isSignedIn() && (request.auth.uid in resource.data.memberUids || resource.data.inviteCode == request.query.inviteCode);
+      allow get: if isSignedIn();
       
       allow create: if isVerified() && isValidGroup(incoming()) && request.auth.uid in incoming().memberUids;
       
-      allow update: if isVerified() && isMemberOfGroup(groupId) && isValidGroup(incoming())
+      allow update: if isVerified() && isValidGroup(incoming())
         && (
-          // Action: Edit metadata
-          (incoming().diff(existing()).affectedKeys().hasOnly(['name', 'emoji', 'dueDate'])) ||
-          // Action: Manage members
-          (incoming().diff(existing()).affectedKeys().hasOnly(['members', 'memberUids'])) ||
+          // Action: Edit metadata (member only)
+          (isMemberOfGroup(groupId) && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'emoji', 'dueDate'])) ||
+          // Action: Manage members (member only)
+          (isMemberOfGroup(groupId) && incoming().diff(existing()).affectedKeys().hasOnly(['members', 'memberUids', 'memberDetails'])) ||
+          // Action: Join (non-member joining via invite)
+          (!isMemberOfGroup(groupId) && request.auth.uid in incoming().memberUids && incoming().diff(existing()).affectedKeys().hasOnly(['members', 'memberUids', 'memberDetails'])) ||
           // Admin override
-          (existing().leader == request.auth.uid)
+          (existing().leaderUid == request.auth.uid)
         );
       
-      allow delete: if isVerified() && existing().leader == request.auth.uid;
+      allow delete: if isVerified() && existing().leaderUid == request.auth.uid;
 
       match /expenses/{expenseId} {
         allow list, get: if isMemberOfGroup(groupId);
         allow create: if isVerified() && isMemberOfGroup(groupId) && isValidExpense(incoming());
         allow update: if isVerified() && isMemberOfGroup(groupId) && isValidExpense(incoming()) && incoming().createdBy == existing().createdBy;
-        allow delete: if isVerified() && isMemberOfGroup(groupId) && (existing().createdBy == request.auth.uid || get(/databases/$(database)/documents/groups/$(groupId)).data.leader == request.auth.uid);
+        allow delete: if isVerified() && isMemberOfGroup(groupId) && (existing().createdBy == request.auth.uid || get(/databases/$(database)/documents/groups/$(groupId)).data.leaderUid == request.auth.uid);
       }
 
       match /payments/{paymentId} {
         allow list, get: if isMemberOfGroup(groupId);
         allow create: if isVerified() && isMemberOfGroup(groupId) && isValidPayment(incoming());
-        allow update: if isVerified() && isMemberOfGroup(groupId) && isValidPayment(incoming()) && incoming().createdBy == existing().createdBy;
-        allow delete: if isVerified() && isMemberOfGroup(groupId) && (existing().createdBy == request.auth.uid || get(/databases/$(database)/documents/groups/$(groupId)).data.leader == request.auth.uid);
+        allow update: if isVerified() && isMemberOfGroup(groupId) && isValidExpense(incoming()) && incoming().createdBy == existing().createdBy;
+        allow delete: if isVerified() && isMemberOfGroup(groupId) && (existing().createdBy == request.auth.uid || get(/databases/$(database)/documents/groups/$(groupId)).data.leaderUid == request.auth.uid);
       }
 
       match /feed/{feedId} {

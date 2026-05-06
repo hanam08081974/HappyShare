@@ -1,8 +1,13 @@
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
+import { QrCode, Receipt, Upload, Loader2, ImagePlus, Camera } from "lucide-react";
 import { initializeApp } from "firebase/app";
 import { getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signOut, User as FirebaseUser } from "firebase/auth";
 import { getFirestore, collection, doc, setDoc, getDoc, getDocs, onSnapshot, query, where, addDoc, updateDoc, deleteDoc, serverTimestamp, getDocFromServer, orderBy } from "firebase/firestore";
+import { GoogleGenAI, Type } from "@google/genai";
 import firebaseConfig from "../firebase-applet-config.json";
+
+// Initialize AI
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
@@ -44,6 +49,15 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
     path
   }
   console.error('Firestore Error: ', JSON.stringify(errInfo));
+  
+  let msg = "Lỗi hệ thống!";
+  if (errInfo.error.includes("permission-denied") || errInfo.error.includes("insufficient permissions")) {
+    msg = "Bạn không có quyền thực hiện thao tác này.";
+  } else if (errInfo.error.includes("quota-exceeded")) {
+    msg = "Hết hạn mức sử dụng miễn phí (Quota exceeded). Thử lại vào ngày mai.";
+  }
+  alert(msg + "\nChi tiết: " + errInfo.operationType + " " + (errInfo.path || ""));
+  
   throw new Error(JSON.stringify(errInfo));
 }
 
@@ -67,11 +81,45 @@ const fmtShort = (n: number) => { if(Math.abs(n)>=1e6) return (n/1e6).toFixed(1)
 const timeAgo = (ts: number) => { const s=Math.floor((Date.now()-ts)/1000); if(s<60)return"vừa xong"; if(s<3600)return`${Math.floor(s/60)}p trước`; if(s<86400)return`${Math.floor(s/3600)}h trước`; return`${Math.floor(s/86400)}d trước`; };
 const genCode = () => Math.random().toString(36).slice(2,8).toUpperCase();
 
+const sendEmailInvite = async (email: string, inviterName: string, groupName: string, inviteId: string) => {
+  try {
+    const inviteLink = `${window.location.origin}/?inviteId=${inviteId}`;
+    const res = await fetch("/api/invite", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, inviterName, groupName, inviteLink }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      if (res.status === 503) {
+        alert("⚠️ Email chưa được gửi: Bạn cần cấu hình SMTP_USER và SMTP_PASS trong phần Settings của AI Studio.");
+      } else {
+        alert("❌ Lỗi gửi email: " + (data.error || "Không xác định"));
+      }
+      return false;
+    }
+    alert("✅ Đã gửi email mời đến: " + email);
+    return true;
+  } catch (err) {
+    console.error("Failed to send email invite:", err);
+    alert("❌ Không thể kết nối với máy chủ gửi email.");
+    return false;
+  }
+};
+
 // ─── Types ───────────────────────────────────────────────────
 interface Friend {
+  id?: string;
   name: string;
-  phone: string;
   email: string;
+  status: 'pending' | 'accepted';
+  createdAt: number;
+}
+
+interface ReceiptItem {
+  name: string;
+  price: number;
+  assignedTo: string[]; // member names
 }
 
 interface Expense {
@@ -79,8 +127,18 @@ interface Expense {
   desc: string;
   amount: number;
   payers: Record<string, number>; // Multiple payers: { name: amount }
-  splitMode: string;
+  splitMode: string; // "equal" | "percent" | "adjust" | "itemized"
   splits: Record<string, number>;
+  ts: number;
+  items?: ReceiptItem[]; // For itemized mode
+  memberDetails?: Record<string, { phone?: string; email?: string; avatar?: string }>;
+}
+
+interface Invitation {
+  id: string;
+  groupId: string;
+  inviterName: string;
+  email: string;
   ts: number;
 }
 
@@ -96,6 +154,26 @@ const computeGroupBalances = (group: Group) => {
     if (exp.splitMode === "equal") return exp.amount / members.length;
     if (exp.splitMode === "percent") return (exp.splits[m] || 0) / 100 * exp.amount;
     if (exp.splitMode === "adjust") return exp.amount / members.length + (exp.splits[m] || 0);
+    if (exp.splitMode === "itemized") {
+      let share = 0;
+      exp.items?.forEach(item => {
+        if (item.assignedTo && item.assignedTo.length > 0) {
+          if (item.assignedTo.includes(m)) {
+            share += item.price / item.assignedTo.length;
+          }
+        } else {
+          // If no one is assigned, split this item evenly among all members
+          share += item.price / members.length;
+        }
+      });
+      // Handle remaining amount if any (e.g. tax/tip)
+      const allocated = exp.items?.reduce((sum, it) => sum + (it.price || 0), 0) || 0;
+      const remaining = exp.amount - allocated;
+      if (remaining > 0.01) {
+        share += remaining / members.length; // distribute tax equally among all members
+      }
+      return share;
+    }
     return 0;
   };
 
@@ -160,8 +238,9 @@ interface Group {
   emoji: string;
   members: string[];
   memberUids: string[];
-  memberDetails?: Record<string, { phone?: string; email?: string }>;
+  memberDetails?: Record<string, { phone?: string; email?: string; avatar?: string }>;
   leader: string;
+  leaderUid: string;
   expenses?: Expense[];
   payments?: Payment[];
   feed?: FeedItem[];
@@ -170,7 +249,10 @@ interface Group {
 }
 
 // ─── Tiny Components ─────────────────────────────────────────
-function Av({ name, size=36, ci=0, style={} }: { name: string, size?: number, ci?: number, style?: any }) {
+function Av({ name, size=36, ci=0, avatar, style={} }: { name: string, size?: number, ci?: number, avatar?: string, style?: any }) {
+  if (avatar) {
+    return <img src={avatar} style={{ width: size, height: size, borderRadius: "50%", objectFit: "cover", flexShrink: 0, ...style }} alt={name} />;
+  }
   const ini = name.trim().split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2);
   return <div style={{width:size,height:size,borderRadius:"50%",background:COLORS[ci%COLORS.length],display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,fontSize:size*.38,flexShrink:0,...style}}>{ini||"?"}</div>;
 }
@@ -224,10 +306,130 @@ function BarChart({ data, maxVal }: { data: {value: number, color: string, label
   );
 }
 
+function JoinGroupView({ inviteId, onJoined, profile }: { inviteId: string, onJoined: (group: Group) => void, profile: UserProfile | null }) {
+  const [invitation, setInvitation] = useState<Invitation | null>(null);
+  const [group, setGroup] = useState<Group | null>(null);
+  const [name, setName] = useState(profile?.name || auth.currentUser?.displayName || "");
+  const [avatar, setAvatar] = useState<string | null>(profile?.avatar || null);
+  const [loading, setLoading] = useState(true);
+  const [joining, setJoining] = useState(false);
+
+  useEffect(() => {
+    if (profile) {
+      setName(profile.name);
+      setAvatar(profile.avatar);
+    }
+  }, [profile]);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const invDoc = await getDoc(doc(db, "invitations", inviteId));
+        if (invDoc.exists()) {
+          const invData = invDoc.data() as Invitation;
+          setInvitation(invData);
+          const grpDoc = await getDoc(doc(db, "groups", invData.groupId));
+          if (grpDoc.exists()) {
+            setGroup({ ...grpDoc.data(), id: grpDoc.id } as Group);
+          }
+        }
+      } catch (err) {
+        handleFirestoreError(err, OperationType.GET, `invitations/${inviteId}`);
+      } finally {
+        setLoading(false);
+      }
+    };
+    load();
+  }, [inviteId]);
+
+  const handleJoin = async () => {
+    if (!name.trim() || !group || joining) return;
+    setJoining(true);
+    try {
+      const newMembers = [...group.members, name.trim()];
+      const currentUids = group.memberUids || [];
+      const newUids = [...currentUids, auth.currentUser?.uid || ""];
+      const newDetails = { ...(group.memberDetails || {}) };
+      if (avatar || profile?.avatar) {
+        newDetails[name.trim()] = { ...(newDetails[name.trim()] || {}), avatar: avatar || profile?.avatar };
+      }
+      
+      await updateDoc(doc(db, "groups", group.id), {
+        members: newMembers,
+        memberUids: newUids,
+        memberDetails: newDetails
+      });
+
+      // Optionally delete invitation
+      await deleteDoc(doc(db, "invitations", inviteId));
+
+      onJoined({ ...group, members: newMembers, memberUids: newUids, memberDetails: newDetails });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, "joining group");
+    } finally {
+      setJoining(false);
+    }
+  };
+
+  useEffect(() => {
+    // If profile is already set, auto join if possible or just show confirmation
+    // For now let's just prefill and let them click "Join"
+  }, [profile]);
+
+  const handleAvatarFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (ev) => setAvatar(ev.target?.result as string);
+      reader.readAsDataURL(file);
+    }
+  };
+
+  if (loading) return <div style={{height: "100vh", display: "flex", alignItems: "center", justifyContent: "center"}}><Loader2 className="animate-spin" color="#7c3aed" /></div>;
+  if (!invitation || !group) return <div style={{padding: 40, textAlign: "center"}}>Lời mời không hợp lệ hoặc đã hết hạn.</div>;
+
+  return (
+    <div style={{minHeight: "100vh", background: "linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%)", padding: "40px 20px", display: "flex", flexDirection: "column", alignItems: "center"}}>
+      <div style={{fontSize: 60, marginBottom: 20}}>{group.emoji}</div>
+      <div style={{textAlign: "center", marginBottom: 30}}>
+        <div style={{fontSize: 20, fontWeight: 800, color: "#1e1e2e"}}>Chào mừng bạn đến với {group.name}</div>
+        <div style={{fontSize: 14, color: "#64748b", marginTop: 6}}><b>{invitation.inviterName}</b> đã mời bạn tham gia nhóm này.</div>
+      </div>
+
+      <Card style={{width: "100%", maxWidth: 400, padding: 24}}>
+        <div style={{textAlign: "center", marginBottom: 20}}>
+          <div style={{position: "relative", display: "inline-block"}}>
+            {avatar ? (
+              <img src={avatar} style={{width: 90, height: 90, borderRadius: "50%", objectFit: "cover", border: "4px solid #fff", boxShadow: "0 4px 12px rgba(0,0,0,0.1)"}} />
+            ) : (
+              <Av name={name || "User"} size={90} ci={0} style={{border: "4px solid #fff", boxShadow: "0 4px 12px rgba(0,0,0,0.1)"}} />
+            )}
+            <label style={{position: "absolute", bottom: 0, right: 0, background: "#7c3aed", color: "#fff", width: 28, height: 28, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", border: "2px solid #fff"}}>
+              <Camera size={14} />
+              <input type="file" accept="image/*" onChange={handleAvatarFile} style={{display: "none"}} />
+            </label>
+          </div>
+          <div style={{fontSize: 12, color: "#94a3b8", marginTop: 8}}>Tải ảnh đại diện (tuỳ chọn)</div>
+        </div>
+
+        <div style={{marginBottom: 20}}>
+          <div style={{fontSize: 12, fontWeight: 700, color: "#1e1e2e", marginBottom: 6}}>BẠN TÊN LÀ GÌ?</div>
+          <Input placeholder="Nhập tên của bạn..." value={name} onChange={(e:any) => setName(e.target.value)} />
+        </div>
+
+        <Btn onClick={handleJoin} disabled={!name.trim() || joining} style={{width: "100%", padding: 15, fontSize: 15}}>
+          {joining ? <Loader2 className="animate-spin" /> : "Tham gia nhóm ngay 🚀"}
+        </Btn>
+      </Card>
+      <div style={{marginTop: 20, fontSize: 12, color: "#94a3b8"}}>HappyShare — Quản lý chi tiêu nhóm dễ dàng</div>
+    </div>
+  );
+}
+
 // ─── Modals ───────────────────────────────────────────────────
 function Modal({ children, onClose }: { children: React.ReactNode, onClose: () => void }) {
   return (
-    <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(76,29,149,.55)",display:"flex",alignItems:"flex-end",justifyContent:"center",zIndex:300,backdropFilter:"blur(4px)"}}>
+    <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(76,29,149,.55)",display:"flex",alignItems:"flex-end",justifyContent:"center",zIndex:1100,backdropFilter:"blur(4px)"}}>
       <div onClick={e=>e.stopPropagation()} style={{background:"#fff",borderRadius:"22px 22px 0 0",padding:"22px 18px 36px",width:"100%",maxWidth:520,boxShadow:"0 -8px 40px rgba(124,58,237,.2)",maxHeight:"88vh",overflowY:"auto"}}>
         <div style={{width:38,height:4,background:"#e2e8f0",borderRadius:4,margin:"0 auto 18px"}}/>
         {children}
@@ -236,13 +438,31 @@ function Modal({ children, onClose }: { children: React.ReactNode, onClose: () =
   );
 }
 
-function BillDetailModal({ bill, members, onClose }: { bill: Expense, members: string[], onClose: () => void }) {
+function BillDetailModal({ bill, members, onClose, onRemove }: { bill: Expense, members: string[], onClose: () => void, onRemove?: () => void }) {
   if (!bill) return null;
-  const { splitMode, splits, amount, payers } = bill;
+  const { splitMode, splits, amount, payers, items } = bill;
   const getMemberShare = (m: string) => {
     if (splitMode === "equal") return amount / members.length;
     if (splitMode === "percent") return (splits[m] || 0) / 100 * amount;
     if (splitMode === "adjust") { const base = amount / members.length; return base + (splits[m] || 0); }
+    if (splitMode === "itemized") {
+      let share = 0;
+      items?.forEach(it => {
+        if (it.assignedTo && it.assignedTo.length > 0) {
+          if (it.assignedTo.includes(m)) {
+            share += it.price / it.assignedTo.length;
+          }
+        } else {
+          share += it.price / members.length;
+        }
+      });
+      const allocated = items?.reduce((sum, it) => sum + (it.price || 0), 0) || 0;
+      const remaining = amount - allocated;
+      if (remaining > 0.01) {
+        share += remaining / members.length;
+      }
+      return share;
+    }
     return 0;
   };
   const payerEntries = Object.entries(payers).filter(([_, amt]) => (amt || 0) > 0);
@@ -253,7 +473,7 @@ function BillDetailModal({ bill, members, onClose }: { bill: Expense, members: s
         <div style={{ width: 46, height: 46, borderRadius: 13, background: "#ede9fe", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>🧾</div>
         <div>
           <div style={{ fontWeight: 800, fontSize: 16 }}>{bill.desc}</div>
-          <div style={{ fontSize: 11, color: "#94a3b8" }}>{timeAgo(bill.ts)} · {splitMode === "equal" ? "Chia đều" : splitMode === "percent" ? "Theo %" : "Có điều chỉnh"}</div>
+          <div style={{ fontSize: 11, color: "#94a3b8" }}>{timeAgo(bill.ts)} · {splitMode === "equal" ? "Chia đều" : splitMode === "percent" ? "Theo %" : splitMode === "itemized" ? "Chia theo món" : "Có điều chỉnh"}</div>
         </div>
       </div>
       <div style={{ background: "linear-gradient(135deg,#7c3aed,#a78bfa)", borderRadius: 12, padding: "12px 16px", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -265,14 +485,14 @@ function BillDetailModal({ bill, members, onClose }: { bill: Expense, members: s
         <div style={{ fontSize: 11, fontWeight: 700, color: "#7c3aed", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Đã thanh toán ({payerEntries.length})</div>
         {payerEntries.map(([name, amt], i) => (
           <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: "#f5f3ff", borderRadius: 11, padding: "9px 13px", marginBottom: 5 }}>
-            <Av name={name} size={34} ci={members.indexOf(name)} />
+            <Av name={name} size={34} ci={members.indexOf(name)} avatar={bill.memberDetails?.[name]?.avatar} />
             <div style={{ flex: 1 }}><div style={{ fontWeight: 700, fontSize: 13 }}>{name}</div></div>
             <span style={{ fontWeight: 800, fontSize: 14, color: "#7c3aed" }}>{fmt(amt)}</span>
           </div>
         ))}
       </div>
 
-      <div>
+      <div style={{ marginBottom: 14 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: "#dc2626", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Phân chia</div>
         {members.map((m, i) => {
           const share = getMemberShare(m);
@@ -280,25 +500,55 @@ function BillDetailModal({ bill, members, onClose }: { bill: Expense, members: s
           const diff = paid - share;
           return (
             <div key={i} style={{ display: "flex", alignItems: "center", gap: 9, background: diff >= 0 ? "#f0fdf4" : "#fef2f2", borderRadius: 11, padding: "9px 13px", marginBottom: 5, border: `1.5px solid ${diff >= 0 ? "#bbf7d0" : "#fecaca"}` }}>
-              <Av name={m} size={32} ci={members.indexOf(m)} />
+              <Av name={m} size={32} ci={members.indexOf(m)} avatar={bill.memberDetails?.[m]?.avatar} />
               <div style={{ flex: 1 }}>
                 <div style={{ fontWeight: 600, fontSize: 13 }}>{m}</div>
-                <div style={{ fontSize: 10, color: "#94a3b8" }}>{diff >= 0 ? "Dư" : "Nợ"}: {fmt(Math.abs(diff))}</div>
+                <div style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>
+                  <span style={{ fontWeight: 900, color: diff >= 0 ? "#16a34a" : "#dc2626", background: diff >= 0 ? "#dcfce7" : "#fee2e2", padding: "1px 4px", borderRadius: 4, fontSize: 9 }}>{diff >= 0 ? "💰 ĐÃ DƯ" : "🔴 CÒN NỢ"}</span>
+                  <span style={{ color: "#64748b" }}>{fmt(Math.abs(diff))}</span>
+                </div>
               </div>
               <span style={{ fontWeight: 800, fontSize: 13, color: diff >= 0 ? "#16a34a" : "#dc2626" }}>{fmt(share)}</span>
             </div>
           );
         })}
       </div>
-      <Btn onClick={onClose} color="#94a3b8" style={{ width: "100%", marginTop: 14 }}>Đóng</Btn>
+
+      {splitMode === "itemized" && items && items.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#475569", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Chi tiết món</div>
+          <div style={{ background: "#f8fafc", borderRadius: 12, padding: "10px 12px", border: "1px solid #e2e8f0" }}>
+            {items.map((it, idx) => (
+              <div key={idx} style={{ padding: "8px 0", borderBottom: idx === items.length - 1 ? "none" : "1px solid #e2e8f0" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontWeight: 600 }}>
+                  <span style={{ fontSize: 13, color: "#1e293b", flex: 1, paddingRight: 10 }}>{it.name}</span>
+                  <span style={{ color: "#ec4899", fontSize: 13, whiteSpace: "nowrap" }}>{fmt(it.price || 0)}</span>
+                </div>
+                <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
+                  {it.assignedTo.length > 0 ? it.assignedTo.join(", ") : "Chia đều cả nhóm"}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+        <Btn onClick={onClose} color="#94a3b8" style={{ flex: 1 }}>Đóng</Btn>
+      </div>
     </Modal>
   );
 }
 
-function AddExpenseModal({ members, onAdd, onClose }: { members: string[], onAdd: (e: Expense) => void, onClose: () => void }) {
+function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: string[], memberDetails?: any, onAdd: (e: Expense) => void, onClose: () => void }) {
   const [desc, setDesc] = useState("");
   const [amount, setAmount] = useState("");
   const [payers, setPayers] = useState<Record<string, number>>({});
+  const [mode, setMode] = useState("equal");
+  const [splits, setSplits] = useState<Record<string, number>>({});
+  
+  const [items, setItems] = useState<ReceiptItem[]>([]);
+  const [isScanning, setIsScanning] = useState(false);
 
   const amt = parseFloat(amount) || 0;
 
@@ -319,9 +569,6 @@ function AddExpenseModal({ members, onAdd, onClose }: { members: string[], onAdd
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [amt]);
 
-  const [mode, setMode] = useState("equal");
-  const [splits, setSplits] = useState<Record<string, number>>({});
-
   const payerVals = Object.values(payers) as number[];
   const totalPaid = payerVals.reduce((s: number, v: number) => s + (v || 0), 0);
 
@@ -333,21 +580,93 @@ function AddExpenseModal({ members, onAdd, onClose }: { members: string[], onAdd
   const valid = desc.trim() && amt > 0 && Math.abs(totalPaid - amt) < 1 && (
     mode === "equal" ||
     (mode === "percent" && Math.abs(totalPct - 100) < 0.01) ||
-    (mode === "adjust" && Math.abs(totalAdj) < 0.01)
+    (mode === "adjust" && Math.abs(totalAdj) < 0.01) ||
+    mode === "itemized"
   );
 
   const handleAdd = () => {
     if (!valid) return;
-    onAdd({ id: String(Date.now()), desc: desc.trim(), amount: amt, payers: { ...payers }, splitMode: mode, splits: { ...splits }, ts: Date.now() });
+    const expData: any = { id: String(Date.now()), desc: desc.trim(), amount: amt, payers: { ...payers }, splitMode: mode, splits: { ...splits }, ts: Date.now() };
+    if (mode === "itemized") expData.items = items;
+    onAdd(expData);
     onClose();
+  };
+
+  const scanReceipt = async (file: File) => {
+    setIsScanning(true);
+    try {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = async (ev) => {
+        const imageStr = ev.target?.result as string;
+        const base64Data = imageStr.split(",")[1];
+        const mimeType = imageStr.substring(imageStr.indexOf(":")+1, imageStr.indexOf(";"));
+        
+        const response = await ai.models.generateContent({
+          model: "gemini-3.1-pro-preview",
+          contents: {
+            parts: [
+              { inlineData: { data: base64Data, mimeType } },
+              { text: "Extract receipt items and prices. Return a JSON array of objects. Format: [{ name: 'item name', price: 1000 }]. No markdown, just JSON." }
+            ]
+          },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.ARRAY,
+              items: { type: Type.OBJECT, properties: { name: { type: Type.STRING }, price: { type: Type.NUMBER } } }
+            }
+          }
+        });
+        
+        const parsed = JSON.parse(response.text || "[]");
+        const list = parsed.map((p: any) => ({ ...p, assignedTo: [] }));
+        setItems(list);
+        setMode("itemized");
+        const tot = list.reduce((s:number,it:any)=>s+(it.price||0), 0);
+        setAmount(tot.toString());
+        if (!desc.trim()) setDesc("Hóa đơn");
+        setIsScanning(false);
+      };
+    } catch(err) {
+      console.error(err);
+      alert("Quét hoá đơn thất bại.");
+      setIsScanning(false);
+    }
+  };
+
+  const toggleAssign = (itemIdx: number, memberName: string) => {
+    const newItems = [...items];
+    const it = newItems[itemIdx];
+    if (it.assignedTo.includes(memberName)) {
+      it.assignedTo = it.assignedTo.filter(m => m !== memberName);
+    } else {
+      it.assignedTo.push(memberName);
+    }
+    setItems(newItems);
   };
 
   return (
     <Modal onClose={onClose}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
-        <div style={{ width: 44, height: 44, borderRadius: 13, background: "#dbeafe", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>🧾</div>
-        <div style={{ fontWeight: 800, fontSize: 16, color: "#1e1e2e" }}>Thêm Khoản Chi</div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ width: 44, height: 44, borderRadius: 13, background: "#dbeafe", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>🧾</div>
+          <div style={{ fontWeight: 800, fontSize: 16, color: "#1e1e2e" }}>Thêm Khoản Chi</div>
+        </div>
+        <div style={{ display: "flex", gap: 5 }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, background: "linear-gradient(135deg,#ec4899,#f43f5e)", color: "#fff", padding: "6px 10px", borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: "pointer", boxShadow: "0 2px 5px rgba(236,72,153,0.3)" }}>
+             {isScanning ? <Loader2 size={14} className="animate-spin"/> : <Camera size={14}/>}
+             {isScanning ? "Đang quét..." : "Chụp AI"}
+             <input type="file" accept="image/*" capture="environment" onChange={(e) => { if(e.target.files?.[0]) scanReceipt(e.target.files[0]); }} style={{ display: "none" }} />
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, background: "#f8fafc", border: "1px solid #cbd5e1", color: "#64748b", padding: "6px 10px", borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+             {isScanning ? <Loader2 size={14} className="animate-spin"/> : <Upload size={14}/>}
+             Ảnh
+             <input type="file" accept="image/*" onChange={(e) => { if(e.target.files?.[0]) scanReceipt(e.target.files[0]); }} style={{ display: "none" }} />
+          </label>
+        </div>
       </div>
+
       <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
         <Input placeholder="Mô tả" value={desc} onChange={(e: any) => setDesc(e.target.value)} />
         <Input placeholder="Số tiền" type="number" min="0" value={amount} onChange={(e: any) => setAmount(e.target.value)} />
@@ -383,7 +702,7 @@ function AddExpenseModal({ members, onAdd, onClose }: { members: string[], onAdd
               const isFull = Math.abs((payers[m] || 0) - amt) < 0.1 && amt > 0;
               return (
                 <div key={i} onClick={() => setPayers({ [m]: amt })} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, cursor: "pointer", padding: "4px 8px", borderRadius: 10, background: isSelected ? "#fff" : "transparent", boxShadow: isSelected ? "0 2px 8px rgba(0,0,0,0.05)" : "none", transition: "all 0.2s" }}>
-                  <Av name={m} size={30} ci={i} />
+                  <Av name={m} size={30} ci={i} avatar={memberDetails?.[m]?.avatar} />
                   <span style={{ fontSize: 13, fontWeight: isSelected ? 700 : 600, color: isSelected ? "#1e293b" : "#64748b", flex: 1 }}>{m}</span>
                   {isSelected && (
                     <div style={{ background: isFull ? "#f0fdf4" : "#f1f5f9", color: isFull ? "#16a34a" : "#64748b", fontSize: 10, fontWeight: 800, padding: "3px 8px", borderRadius: 6 }}>
@@ -399,8 +718,8 @@ function AddExpenseModal({ members, onAdd, onClose }: { members: string[], onAdd
         <div>
           <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Kiểu chia</div>
           <div style={{ display:"flex", background: "#f1f5f9", borderRadius:10, padding:3, gap:2 }}>
-            {[["equal", "⚖️ Đều"], ["percent", "📊 %"], ["adjust", "🔧 Adj"]].map(([v, l]) => (
-              <button key={v} onClick={() => setMode(v)} style={{ flex: 1, padding: "7px 4px", border: "none", borderRadius: 8, background: mode === v ? "#7c3aed" : "transparent", color: mode === v ? "#fff" : "#64748b", fontWeight: 700, fontSize: 11, cursor: "pointer" }}>{l}</button>
+            {[["equal", "⚖️ Đều"], ["percent", "📊 %"], ["adjust", "🔧 Adj"], ["itemized", "🍔 Món"]].map(([v, l]) => (
+              <button key={v} onClick={() => setMode(v)} style={{ flex: 1, padding: "7px 4px", border: "none", borderRadius: 8, background: mode === v ? "#7c3aed" : "transparent", color: mode === v ? "#fff" : "#64748b", fontWeight: 700, fontSize: 11, cursor: "pointer", whiteSpace: "nowrap" }}>{l}</button>
             ))}
           </div>
         </div>
@@ -415,14 +734,38 @@ function AddExpenseModal({ members, onAdd, onClose }: { members: string[], onAdd
           </div>
         )}
 
-        {mode !== "equal" && (
+        {mode === "itemized" && (
+           <div style={{ background: "#f8fafc", borderRadius: 12, padding: "10px 12px" }}>
+            {items.length === 0 && <div style={{fontSize: 12, color: "#94a3b8", textAlign: "center", padding: 10}}>Bấm nút "Quét AI" ở trên để phân tích hóa đơn, hoặc chọn kiểu chia khác.</div>}
+            {items.map((it, idx) => (
+              <div key={idx} style={{marginBottom: 12, padding: "10px", border: "1px solid #e2e8f0", borderRadius: 10, background: "#fff"}}>
+                <div style={{display: "flex", justifyContent: "space-between", fontWeight: 600, marginBottom: 8}}>
+                  <span style={{fontSize: 13, color: "#1e293b"}}>{it.name}</span>
+                  <span style={{color: "#ec4899", fontSize: 13}}>{fmt(it.price || 0)}</span>
+                </div>
+                <div style={{display: "flex", flexWrap: "wrap", gap: 6}}>
+                  {members.map(m => {
+                    const isAsg = it.assignedTo.includes(m);
+                    return (
+                      <button key={m} onClick={() => toggleAssign(idx, m)} style={{padding: "4px 10px", borderRadius: 12, border: `1px solid ${isAsg ? "#ec4899" : "#cbd5e1"}`, background: isAsg ? "#fdf2f8" : "#fff", color: isAsg ? "#be185d" : "#64748b", fontSize: 11, fontWeight: 600, cursor: "pointer"}}>
+                        {m}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            ))}
+           </div>
+        )}
+
+        {mode !== "equal" && mode !== "itemized" && (
           <div style={{ background: "#f8fafc", borderRadius: 12, padding: "10px 12px" }}>
             {mode === "percent" && (
               <>
                 <div style={{ fontSize: 11, color: Math.abs(totalPct - 100) < 0.01 ? "#059669" : "#dc2626", fontWeight: 700, marginBottom: 8 }}>Tổng: {totalPct}%</div>
                 {members.map((m, i) => (
                   <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                    <Av name={m} size={26} ci={i} /><span style={{ flex: 1, fontSize: 12, fontWeight: 600 }}>{m}</span>
+                    <Av name={m} size={26} ci={i} avatar={memberDetails?.[m]?.avatar}/><span style={{ flex: 1, fontSize: 12, fontWeight: 600 }}>{m}</span>
                     <input type="number" value={splits[m] || ""} onChange={e => updateSplit(m, e.target.value)} placeholder="0" style={{ width: 60, border: "2px solid #e2e8f0", borderRadius: 8, padding: "5px 7px", fontSize: 13, outline: "none", textAlign: "right" }} />
                     <span style={{ fontSize: 11, color: "#94a3b8", minWidth: 60 }}>{fmt((splits[m] || 0) / 100 * amt)}</span>
                   </div>
@@ -434,7 +777,7 @@ function AddExpenseModal({ members, onAdd, onClose }: { members: string[], onAdd
                 <div style={{ fontSize: 11, color: Math.abs(totalAdj) < 0.01 ? "#059669" : "#dc2626", fontWeight: 700, marginBottom: 8 }}>Bù: {fmt(totalAdj)}</div>
                 {members.map((m, i) => (
                   <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                    <Av name={m} size={26} ci={i} /><span style={{ flex: 1, fontSize: 12, fontWeight: 600 }}>{m}</span>
+                    <Av name={m} size={26} ci={i} avatar={memberDetails?.[m]?.avatar}/><span style={{ flex: 1, fontSize: 12, fontWeight: 600 }}>{m}</span>
                     <input type="number" value={splits[m] || ""} onChange={e => updateSplit(m, e.target.value)} placeholder="0" style={{ width: 80, border: "2px solid #e2e8f0", borderRadius: 8, padding: "5px 7px", fontSize: 13, outline: "none", textAlign: "right" }} />
                   </div>
                 ))}
@@ -448,7 +791,7 @@ function AddExpenseModal({ members, onAdd, onClose }: { members: string[], onAdd
   );
 }
 
-function PayModal({ members, transactions, onPay, onClose }: { members: string[], transactions: any[], onPay: (p: Payment) => void, onClose: () => void }) {
+function PayModal({ members, memberDetails, transactions, onPay, onClose }: { members: string[], memberDetails?: any, transactions: any[], onPay: (p: Payment) => void, onClose: () => void }) {
   const [from,setFrom]=useState(transactions[0]?.from||members[0]||"");
   const [to,setTo]=useState(transactions[0]?.to||"");
   const [amount,setAmount]=useState(transactions[0]?Math.round(transactions[0].amount):"");
@@ -471,7 +814,7 @@ function PayModal({ members, transactions, onPay, onClose }: { members: string[]
         <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
           {members.map((m,i)=>(
             <button key={i} onClick={()=>{setFrom(m);const s=transactions.find(t=>t.from===m);if(s){setTo(s.to);setAmount(Math.round(s.amount).toString());}}} style={{display:"flex",alignItems:"center",gap:5,padding:"5px 10px 5px 5px",borderRadius:18,border:`2px solid ${from===m?"#7c3aed":"#e2e8f0"}`,background:from===m?"#f5f3ff":"#fff",cursor:"pointer"}}>
-              <Av name={m} size={22} ci={i}/><span style={{fontSize:12,fontWeight:600,color:from===m?"#7c3aed":"#374151"}}>{m}</span>
+              <Av name={m} size={22} ci={i} avatar={memberDetails?.[m]?.avatar}/><span style={{fontSize:12,fontWeight:600,color:from===m?"#7c3aed":"#374151"}}>{m}</span>
             </button>
           ))}
         </div>
@@ -481,7 +824,7 @@ function PayModal({ members, transactions, onPay, onClose }: { members: string[]
         <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
           {members.filter(m=>m!==from).map((m,i)=>(
             <button key={i} onClick={()=>{setTo(m);const s=transactions.find(t=>t.from===from&&t.to===m);if(s)setAmount(Math.round(s.amount).toString());}} style={{display:"flex",alignItems:"center",gap:5,padding:"5px 10px 5px 5px",borderRadius:18,border:`2px solid ${to===m?"#059669":"#e2e8f0"}`,background:to===m?"#f0fdf4":"#fff",cursor:"pointer"}}>
-              <Av name={m} size={22} ci={members.indexOf(m)}/><span style={{fontSize:12,fontWeight:600,color:to===m?"#059669":"#374151"}}>{m}</span>
+              <Av name={m} size={22} ci={members.indexOf(m)} avatar={memberDetails?.[m]?.avatar}/><span style={{fontSize:12,fontWeight:600,color:to===m?"#059669":"#374151"}}>{m}</span>
             </button>
           ))}
         </div>
@@ -495,43 +838,57 @@ function PayModal({ members, transactions, onPay, onClose }: { members: string[]
 }
 
 function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, onLeave, onDelete }: { group: Group, friends: Friend[], currentUser: string, onClose: () => void, onUpdate: (g: Group) => void, onLeave: () => void, onDelete: () => void }) {
-  const [newName, setNewName] = useState("");
-  const [newPhone, setNewPhone] = useState("");
-  const [newEmail, setNewEmail] = useState("");
-  const isLeader = group.leader === currentUser;
+  const [newInviteEmail, setNewInviteEmail] = useState("");
+  const [invitations, setInvitations] = useState<Invitation[]>([]);
+  const isLeader = group.leaderUid ? group.leaderUid === auth.currentUser?.uid : group.leader === currentUser;
   const inviteCode = group.inviteCode;
-  const [copied, setCopied] = useState(false);
+  const [copiedCode, setCopiedCode] = useState(false);
 
-  const copy = () => { navigator.clipboard.writeText(inviteCode); setCopied(true); setTimeout(() => setCopied(false), 2000); };
+  useEffect(() => {
+    const unsub = onSnapshot(query(collection(db, "invitations"), where("groupId", "==", group.id)), (snap) => {
+      setInvitations(snap.docs.map(d => ({ ...d.data(), id: d.id } as Invitation)));
+    }, err => handleFirestoreError(err, OperationType.LIST, "invitations"));
+    return unsub;
+  }, [group.id]);
+
+  const copyCode = () => { navigator.clipboard.writeText(inviteCode); setCopiedCode(true); setTimeout(() => setCopiedCode(false), 2000); };
   
-  const addM = () => {
-    const name = newName.trim();
-    if (!name || group.members.includes(name)) return;
-    const newDetails = { ... (group.memberDetails || {}) };
-    if (newPhone || newEmail) {
-      newDetails[name] = { phone: newPhone, email: newEmail };
+  const sendInvite = async () => {
+    const email = newInviteEmail.trim();
+    if (!email || !email.includes("@")) return;
+    if (email === auth.currentUser?.email) {
+      alert("Bạn không thể mời chính mình!");
+      return;
     }
-    onUpdate({
-      ...group,
-      members: [...group.members, name],
-      memberUids: [...group.memberUids, ""],
-      memberDetails: newDetails
-    });
-    setNewName(""); setNewPhone(""); setNewEmail("");
+    try {
+      const invDoc = await addDoc(collection(db, "invitations"), {
+        groupId: group.id,
+        inviterName: auth.currentUser?.displayName || "Trưởng nhóm",
+        email,
+        ts: Date.now()
+      });
+      sendEmailInvite(email, auth.currentUser?.displayName || "Bạn", group.name, invDoc.id);
+      setNewInviteEmail("");
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, "invitations");
+    }
   };
 
-  const addFriendToGroup = (f: Friend) => {
-    if (group.members.includes(f.name)) return;
-    const newDetails = { ... (group.memberDetails || {}) };
-    if (f.phone || f.email) {
-      newDetails[f.name] = { phone: f.phone, email: f.email };
+  const removeInvite = async (id: string) => {
+    try {
+      await deleteDoc(doc(db, "invitations", id));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `invitations/${id}`);
     }
-    onUpdate({
-      ...group,
-      members: [...group.members, f.name],
-      memberUids: [...group.memberUids, ""],
-      memberDetails: newDetails
-    });
+  };
+
+  const getInviteLink = (id: string) => {
+    return `${window.location.origin}/?inviteId=${id}`;
+  };
+
+  const copyLink = (id: string) => {
+    navigator.clipboard.writeText(getInviteLink(id));
+    alert("Đã sao chép link mời!");
   };
 
   return (
@@ -541,7 +898,7 @@ function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, on
         <SecTitle icon="🔗" title="Mã mời" color="#7c3aed"/>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <div style={{flex:1,background:"#ede9fe",borderRadius:9,padding:"10px 14px",fontWeight:800,fontSize:18,color:"#7c3aed",letterSpacing:3,textAlign:"center"}}>{inviteCode}</div>
-          <button onClick={copy} style={{background:copied?"#059669":"#7c3aed",color:"#fff",border:"none",borderRadius:9,padding:"10px 14px",fontWeight:700,fontSize:12,cursor:"pointer"}}>{copied?"✅ Đã sao chép":"📋 Sao chép"}</button>
+          <button onClick={copyCode} style={{background:copiedCode?"#059669":"#7c3aed",color:"#fff",border:"none",borderRadius:9,padding:"10px 14px",fontWeight:700,fontSize:12,cursor:"pointer"}}>{copiedCode?"✅ Đã sao chép":"📋 Sao chép"}</button>
         </div>
       </Card>
       <Card style={{marginBottom:10}}>
@@ -549,45 +906,52 @@ function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, on
         <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
           {group.members.map((m,i)=>(
             <div key={i} style={{display:"flex",alignItems:"center",gap:8,background:"#f8fafc",padding:"8px 10px",borderRadius:10}}>
-              <Av name={m} size={28} ci={i}/>
+              <Av name={m} size={28} ci={group.members.indexOf(m)} avatar={group.memberDetails?.[m]?.avatar}/>
               <span style={{flex:1,fontSize:13,fontWeight:600}}>{m}</span>
               {m !== group.leader && isLeader && (
                 <div onClick={() => {
-                   const f = friends.find(x => x.name === m);
-                   const isLeaderNode = m === group.leader;
-                   if (!isLeaderNode && isLeader) {
-                     const newM = group.members.filter(x => x !== m);
-                     const newUids = group.memberUids.filter((_, idx) => group.members[idx] !== m);
-                     const newDetails = { ...group.memberDetails };
-                     delete newDetails[m];
-                     onUpdate({ ...group, members: newM, memberUids: newUids, memberDetails: newDetails });
-                   }
+                   const newM = group.members.filter(x => x !== m);
+                   const newUids = group.memberUids.filter((_, idx) => group.members[idx] !== m);
+                   const newDetails = { ...group.memberDetails };
+                   delete newDetails[m];
+                   onUpdate({ ...group, members: newM, memberUids: newUids, memberDetails: newDetails });
                 }} style={{ background: "none", border: "none", color: "#dc2626", fontSize: 18, cursor: "pointer" }}>×</div>
               )}
             </div>
           ))}
         </div>
         
-        <div style={{ height: 1, background: "#f1f5f9", margin: "10px 0" }} />
+        <div style={{ height: 1, background: "#f1f5f9", margin: "14px 0" }} />
         
-        <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>CHỌN BẠN BÈ ĐÃ CÓ</div>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", maxHeight: 80, overflowY: "auto", background: "#f8fafc", padding: 8, borderRadius: 8, border: "1px solid #e2e8f0", marginBottom: 12 }}>
-          {friends.filter(f => !group.members.includes(f.name)).map((f, i) => (
-            <button key={i} onClick={() => addFriendToGroup(f)} style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 8px", borderRadius: 12, border: "1px solid #7c3aed", background: "#fff", cursor: "pointer", fontSize: 11, fontWeight: 600, color: "#7c3aed" }}>
-              +{f.name}
-            </button>
+        <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>LỜI MỜI ĐANG CHỜ ({invitations.length})</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
+          {invitations.map((inv) => (
+            <div key={inv.id} style={{ display: "flex", alignItems: "center", gap: 8, background: "#fdf2f8", padding: "8px 10px", borderRadius: 10, border: "1px solid #fecaca" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: "#be185d" }}>{inv.email}</div>
+                <div style={{ fontSize: 10, color: "#fb7185" }}>Chờ chấp nhận · {timeAgo(inv.ts)}</div>
+              </div>
+              <button onClick={() => copyLink(inv.id)} style={{ background: "#be185d", color: "#fff", border: "none", padding: "4px 8px", borderRadius: 6, fontSize: 10, fontWeight: 700, cursor: "pointer" }}>Link</button>
+              {isLeader && <button onClick={() => removeInvite(inv.id)} style={{ background: "none", border: "none", color: "#dc2626", fontSize: 16, cursor: "pointer" }}>×</button>}
+            </div>
           ))}
-          {friends.filter(f => !group.members.includes(f.name)).length === 0 && <div style={{ fontSize: 10, color: "#94a3b8" }}>Không có bạn mới để thêm.</div>}
+          {invitations.length === 0 && <div style={{ fontSize: 11, color: "#94a3b8", textAlign: "center" }}>Không có lời mời nào đang chờ.</div>}
         </div>
 
-        <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>THÊM THÀNH VIÊN MỚI</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <Input placeholder="Họ và tên" value={newName} onChange={(e: any) => setNewName(e.target.value)} style={{ fontSize: 13 }} />
-          <div style={{ display: "flex", gap: 8 }}>
-            <Input placeholder="Số điện thoại" value={newPhone} onChange={(e: any) => setNewPhone(e.target.value)} style={{ fontSize: 13, flex: 1 }} />
-            <Input placeholder="Email" value={newEmail} onChange={(e: any) => setNewEmail(e.target.value)} style={{ fontSize: 13, flex: 1 }} />
-          </div>
-          <Btn onClick={addM} style={{ width: "100%", fontSize: 13 }}>✨ Thêm người này</Btn>
+        <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>MỜI NHANH TỪ BẠN BÈ</div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", maxHeight: 80, overflowY: "auto", background: "#f8fafc", padding: 8, borderRadius: 8, border: "1px solid #e2e8f0", marginBottom: 15 }}>
+          {friends.filter(f => f.email && !group.members.includes(f.name) && !invitations.some(inv => inv.email === f.email)).map((f, i) => (
+            <button key={i} onClick={() => { setNewInviteEmail(f.email || ""); }} style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 8px", borderRadius: 12, border: "1px solid #7c3aed", background: "#fff", cursor: "pointer", fontSize: 11, fontWeight: 600, color: "#7c3aed" }}>
+              {f.name} ({f.email})
+            </button>
+          ))}
+          {friends.filter(f => f.email && !group.members.includes(f.name)).length === 0 && <div style={{ fontSize: 10, color: "#94a3b8" }}>Không có bạn bè nào có email để mời nhanh.</div>}
+        </div>
+
+        <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>MỜI THÀNH VIÊN MỚI QUA EMAIL</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Input placeholder="Nhập email..." value={newInviteEmail} onChange={(e: any) => setNewInviteEmail(e.target.value)} style={{ fontSize: 13, flex: 1 }} />
+          <Btn onClick={sendInvite} style={{ fontSize: 13 }}>Gửi</Btn>
         </div>
       </Card>
       <div style={{display:"flex",flexDirection:"column",gap:8}}>
@@ -647,7 +1011,7 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
                 const b=balances[m]||0;
                 return (
                   <div key={i} style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
-                    <Av name={m} size={20} ci={i}/>
+                    <Av name={m} size={20} ci={i} avatar={group.memberDetails?.[m]?.avatar}/>
                     <span style={{fontSize:12,fontWeight:600,flex:1}}>{m}</span>
                     <span style={{fontSize:11,fontWeight:700,color:b>0.01?"#059669":b<-0.01?"#dc2626":"#94a3b8"}}>{b>0.01?"+":""}{fmtShort(b)}</span>
                   </div>
@@ -658,6 +1022,313 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
         </>
       )}
     </Card>
+  );
+}
+
+function EmailSettingsModal({ prefs, onUpdate, onClose }: { prefs: UserPrefs, onUpdate: (p: Partial<UserPrefs>) => void, onClose: () => void }) {
+  return (
+    <Modal onClose={onClose}>
+      <SecTitle icon="📨" title="Thông báo Email" color="#7c3aed" />
+      <div style={{display: "flex", flexDirection: "column", gap: 10, marginTop: 10}}>
+         {[
+           { id: "emailOnPayment", label: "Có người trả tiền", desc: "Nhận mail khi có thành viên thanh toán trong nhóm" },
+           { id: "emailOnDebtReminder", label: "Nhắc nợ", desc: "Nhận mail khi có người yêu cầu bạn trả tiền" },
+           { id: "emailOnAddedToGroup", label: "Được thêm vào nhóm", desc: "Nhận mail khi bạn trở thành thành viên nhóm mới" },
+           { id: "emailOnAddedAsFriend", label: "Kết bạn mới", desc: "Nhận mail khi ai đó lưu bạn vào danh sách bạn" },
+           { id: "emailOnMonthlyReport", label: "Báo cáo tháng", desc: "Bản tin tổng hợp chi tiêu cuối mỗi tháng" }
+         ].map((item) => (
+           <div key={item.id} style={{display:"flex", alignItems:"center", justifyContent:"space-between", padding:"12px 0", borderBottom:"1px solid #f1f5f9"}}>
+              <div style={{flex:1, marginRight:12}}>
+                 <div style={{fontSize:14, fontWeight:600, color:"#1e293b", marginBottom: 2}}>{item.label}</div>
+                 <div style={{fontSize:11, color:"#64748b"}}>{item.desc}</div>
+              </div>
+              <div 
+                onClick={() => onUpdate({ [item.id]: !((prefs as any)[item.id]) })}
+                style={{
+                  width: 44, height: 24, borderRadius: 12, background: (prefs as any)[item.id] ? "#7c3aed" : "#e2e8f0",
+                  position: "relative", cursor: "pointer", transition: "0.2s"
+                }}
+              >
+                 <div style={{
+                   width: 18, height: 18, borderRadius: "50%", background: "#fff",
+                   position: "absolute", top: 3, left: (prefs as any)[item.id] ? 23 : 3,
+                   transition: "0.2s", boxShadow: "0 2px 4px rgba(0,0,0,0.1)"
+                 }}/>
+              </div>
+           </div>
+         ))}
+      </div>
+      <Btn onClick={onClose} style={{width: "100%", marginTop: 20}}>Xong</Btn>
+    </Modal>
+  );
+}
+
+function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddExpense: (groupId: string, e: Expense) => void }) {
+  const [step, setStep] = useState(1);
+  const [groupId, setGroupId] = useState("");
+  const [imageStr, setImageStr] = useState<string | null>(null);
+  const [isScanning, setIsScanning] = useState(false);
+  const [items, setItems] = useState<ReceiptItem[]>([]);
+  const [desc, setDesc] = useState("Hóa đơn");
+  const [payers, setPayers] = useState<Record<string, number>>({});
+
+  const group = groups.find(g => g.id === groupId);
+  const members = group?.members || [];
+
+  const handleImage = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      setImageStr(ev.target?.result as string);
+      setStep(2);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const scanReceipt = async () => {
+    if(!imageStr) return;
+    setIsScanning(true);
+    try {
+      const base64Data = imageStr.split(",")[1];
+      const mimeType = imageStr.substring(imageStr.indexOf(":")+1, imageStr.indexOf(";"));
+      
+      const response = await ai.models.generateContent({
+        model: "gemini-3.1-pro-preview",
+        contents: {
+          parts: [
+            { inlineData: { data: base64Data, mimeType } },
+            { text: "Extract receipt items and prices. Return a JSON array of objects. Format: [{ name: 'item name', price: 1000 }]. No markdown, just JSON." }
+          ]
+        },
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                name: { type: Type.STRING },
+                price: { type: Type.NUMBER }
+              }
+            }
+          }
+        }
+      });
+      
+      const text = response.text || "[]";
+      const parsed = JSON.parse(text);
+      setItems(parsed.map((p: any) => ({ ...p, assignedTo: [] })));
+      if (members.length > 0) setPayers({ [members[0]]: parsed.reduce((s:number,it:any)=>s+(it.price||0), 0) });
+      setStep(3);
+    } catch(err) {
+      console.error(err);
+      alert("Oops! Quét hoá đơn thất bại.");
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  const toggleAssign = (itemIdx: number, memberName: string) => {
+    const newItems = [...items];
+    const it = newItems[itemIdx];
+    if (it.assignedTo.includes(memberName)) {
+      it.assignedTo = it.assignedTo.filter(m => m !== memberName);
+    } else {
+      it.assignedTo.push(memberName);
+    }
+    setItems(newItems);
+  };
+
+  const total = items.reduce((s, it) => s + (it.price || 0), 0);
+
+  const save = () => {
+    if(!group) return;
+    onAddExpense(group.id, {
+      id: String(Date.now()),
+      desc,
+      amount: total,
+      payers,
+      splitMode: "itemized",
+      splits: {},
+      ts: Date.now(),
+      items
+    });
+    setStep(1); setImageStr(null); setGroupId(""); setItems([]);
+  };
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [isCameraLive, setIsCameraLive] = useState(false);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      setCameraStream(stream);
+      setIsCameraLive(true);
+    } catch (err) {
+      console.error("Camera error:", err);
+      alert("Không thể mở camera. Vui lòng kiểm tra quyền truy cập. Thử mở ứng dụng trong thẻ mới (Open in new tab).");
+    }
+  };
+
+  useEffect(() => {
+    if (isCameraLive && videoRef.current && cameraStream) {
+      videoRef.current.srcObject = cameraStream;
+      videoRef.current.onloadedmetadata = () => {
+        videoRef.current?.play().catch(e => console.error("Play error:", e));
+      };
+    }
+  }, [isCameraLive, cameraStream]);
+
+  const stopCamera = () => {
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(track => track.stop());
+    }
+    setIsCameraLive(false);
+    setCameraStream(null);
+  };
+
+  const capturePhoto = () => {
+    if (videoRef.current) {
+      const canvas = document.createElement("canvas");
+      canvas.width = videoRef.current.videoWidth;
+      canvas.height = videoRef.current.videoHeight;
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+        ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+        setImageStr(canvas.toDataURL("image/jpeg"));
+        setStep(2);
+        stopCamera();
+      }
+    }
+  };
+
+  useEffect(() => {
+    return () => stopCamera();
+  }, []);
+
+  if (groups.length === 0) {
+    return <div style={{padding: 40, textAlign: "center", color: "#64748b"}}>Bạn cần tham gia ít nhất 1 nhóm để quét hóa đơn.</div>;
+  }
+
+  return (
+    <div style={{padding: "20px 14px", paddingBottom: 100, maxWidth: 500, margin: "0 auto"}}>
+      <SecTitle icon="📷" title="Quét Hóa Đơn AI" color="#ec4899" />
+      
+      {step === 1 && (
+        <Card>
+          <div style={{fontWeight: 700, fontSize: 13, marginBottom: 10}}>Chọn nhóm thanh toán:</div>
+          <select value={groupId} onChange={e=>setGroupId(e.target.value)} style={{width: "100%", padding: 10, borderRadius: 10, border: "2px solid #e2e8f0", marginBottom: 20, outline: "none"}}>
+            <option value="">-- Chọn nhóm --</option>
+            {groups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+          </select>
+
+          {groupId && !isCameraLive && (
+             <div style={{display: "flex", flexDirection: "column", gap: 10}}>
+                <button onClick={startCamera} style={{display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: 15, background: "linear-gradient(135deg,#ec4899,#f43f5e)", border: "none", color: "#fff", borderRadius: 12, cursor: "pointer", fontWeight: 700}}>
+                   <Camera size={20} />
+                   Quét trực tiếp (Camera)
+                </button>
+                <label style={{display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: 15, background: "#f8fafc", color: "#64748b", border: "2px dashed #cbd5e1", borderRadius: 12, cursor: "pointer", fontWeight: 700}}>
+                   <Upload size={20} />
+                   Tải ảnh lên
+                   <input type="file" accept="image/*" onChange={handleImage} style={{display: "none"}} />
+                </label>
+             </div>
+          )}
+
+          {isCameraLive && (
+            <div style={{position: "fixed", inset: 0, zIndex: 9999, background: "#000", display: "flex", flexDirection: "column"}}>
+              <div style={{padding: "20px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", background: "rgba(0,0,0,0.5)", position: "absolute", top: 0, left: 0, right: 0, zIndex: 10}}>
+                <div style={{color: "#fff", fontWeight: 700, fontSize: 18}}>Chụp hóa đơn</div>
+                <button onClick={stopCamera} style={{background: "rgba(255,255,255,0.2)", border: "none", borderRadius: "50%", width: 36, height: 36, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer"}}>✕</button>
+              </div>
+              <div style={{flex: 1, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", position: "relative"}}>
+                <video ref={videoRef} autoPlay playsInline muted style={{width: "100%", aspectRatio: "1", objectFit: "cover", display: "block"}} />
+                {/* Guide frame */}
+                <div style={{position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", width: "90%", aspectRatio: "1", border: "2px dashed rgba(255,255,255,0.5)", borderRadius: 20, pointerEvents: "none"}}></div>
+              </div>
+              <div style={{padding: "30px 20px", background: "#000", display: "flex", justifyContent: "center"}}>
+                <button onClick={capturePhoto} style={{width: 70, height: 70, borderRadius: "50%", border: "4px solid #fff", background: "#ec4899", cursor: "pointer", boxShadow: "0 4px 15px rgba(236,72,153,0.5)"}}></button>
+              </div>
+            </div>
+          )}
+        </Card>
+      )}
+
+      {step === 2 && imageStr && (
+        <Card>
+          <div style={{fontWeight: 700, marginBottom: 10}}>Ảnh hóa đơn:</div>
+          <img src={imageStr} alt="Bill" style={{width: "100%", borderRadius: 10, marginBottom: 15, maxHeight: 300, objectFit: "contain", background: "#f8fafc"}} />
+          <Btn onClick={scanReceipt} disabled={isScanning} color="linear-gradient(135deg,#ec4899,#f43f5e)" style={{width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 10}}>
+             {isScanning ? <Loader2 size={18} className="animate-spin" /> : <Receipt size={18} />}
+             {isScanning ? "AI đang phân tích..." : "Quét bằng AI"}
+          </Btn>
+          {!isScanning && <Btn onClick={() => setStep(1)} color="#e2e8f0" style={{width: "100%", marginTop: 10, color: "#475569"}}>Hủy</Btn>}
+        </Card>
+      )}
+
+      {step === 3 && (
+        <div style={{animation: "fadeIn 0.3s"}}>
+          <Card style={{marginBottom: 10}}>
+            <Input placeholder="Mô tả hóa đơn" value={desc} onChange={(e: any) => setDesc(e.target.value)} style={{marginBottom: 10}} />
+            <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px", background: "#fdf2f8", borderRadius: 10, color: "#be185d", fontWeight: 800}}>
+              <span>Tổng cộng:</span>
+              <span style={{fontSize: 18}}>{total.toLocaleString()}đ</span>
+            </div>
+          </Card>
+
+          <Card style={{marginBottom: 10}}>
+            <div style={{fontWeight: 700, marginBottom: 10}}>Ai là người trả tiền?</div>
+            <div style={{ display: "flex", gap: 6, marginBottom: 10, overflowX: "auto", paddingBottom: 4 }}>
+              <button 
+                onClick={() => setPayers({ [members[0]]: total })} 
+                style={{ background: payers[members[0]] === total ? "#ec4899" : "#f1f5f9", color: payers[members[0]] === total ? "#fff" : "#64748b", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}
+              >
+                🙋 Bạn trả hết
+              </button>
+              <button 
+                onClick={() => {
+                  const share = total / members.length;
+                  const p: any = {};
+                  members.forEach(m => p[m] = share);
+                  setPayers(p);
+                }} 
+                style={{ background: Object.keys(payers).length > 1 ? "#ec4899" : "#f1f5f9", color: Object.keys(payers).length > 1 ? "#fff" : "#64748b", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}
+              >
+                🤝 Cả nhóm cùng trả
+              </button>
+            </div>
+          </Card>
+
+          <Card style={{marginBottom: 10}}>
+            <div style={{fontWeight: 700, marginBottom: 10}}>Chia theo món:</div>
+            {items.map((it, idx) => (
+              <div key={idx} style={{marginBottom: 12, padding: "10px", border: "1px solid #e2e8f0", borderRadius: 10}}>
+                <div style={{display: "flex", justifyContent: "space-between", fontWeight: 600, marginBottom: 8}}>
+                  <span>{it.name}</span>
+                  <span style={{color: "#ec4899"}}>{(it.price || 0).toLocaleString()}đ</span>
+                </div>
+                <div style={{display: "flex", flexWrap: "wrap", gap: 6}}>
+                  {members.map(m => {
+                    const isAsg = it.assignedTo.includes(m);
+                    return (
+                      <button key={m} onClick={() => toggleAssign(idx, m)} style={{padding: "4px 8px", borderRadius: 12, border: `1px solid ${isAsg ? "#ec4899" : "#cbd5e1"}`, background: isAsg ? "#fdf2f8" : "#fff", color: isAsg ? "#be185d" : "#64748b", fontSize: 11, fontWeight: 600, cursor: "pointer"}}>
+                        {m}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            ))}
+          </Card>
+          
+          <Btn onClick={save} color="linear-gradient(135deg,#ec4899,#f43f5e)" style={{width: "100%"}}>✅ Thêm vào nhóm</Btn>
+          <Btn onClick={() => setStep(1)} color="#e2e8f0" style={{width: "100%", marginTop: 10, color: "#475569"}}>Hủy</Btn>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -692,7 +1363,11 @@ function GroupView({ group, friends, onUpdate, onDelete, onLeave, onBack }: { gr
     try {
       const mainPayer = Object.keys(exp.payers).find(k => (exp.payers[k] || 0) > 0) || "Ai đó";
       const { id, ...data } = exp;
-      await addDoc(collection(db, "groups", group.id, "expenses"), { ...data, createdBy: auth.currentUser?.uid });
+      await addDoc(collection(db, "groups", group.id, "expenses"), { 
+        ...data, 
+        createdBy: auth.currentUser?.uid,
+        memberDetails: group.memberDetails || {} 
+      });
       await addDoc(collection(db, "groups", group.id, "feed"), {
         type: "expense",
         text: `${mainPayer} đã thêm "${exp.desc}" — ${fmt(exp.amount)}`,
@@ -701,15 +1376,18 @@ function GroupView({ group, friends, onUpdate, onDelete, onLeave, onBack }: { gr
         name: mainPayer
       });
     } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, "expenses");
+      handleFirestoreError(err, OperationType.CREATE, `groups/${group.id}/expenses`);
     }
   };
 
   const removeExpense = async (id: string) => {
     try {
       await deleteDoc(doc(db, "groups", group.id, "expenses", id));
+      alert("✅ Đã xóa hóa đơn!");
+      return true;
     } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, `expenses/${id}`);
+      handleFirestoreError(err, OperationType.DELETE, `groups/${group.id}/expenses/${id}`);
+      return false;
     }
   };
 
@@ -735,10 +1413,16 @@ function GroupView({ group, friends, onUpdate, onDelete, onLeave, onBack }: { gr
 
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
-      {selectedBill&&<BillDetailModal bill={selectedBill} members={members} onClose={()=>setSelectedBill(null)}/>}
-      {showAddExp&&<AddExpenseModal members={members} onAdd={addExpense} onClose={()=>setShowAddExp(false)}/>}
-      {showPay&&<PayModal members={members} transactions={transactions} onPay={addPayment} onClose={()=>setShowPay(false)}/>}
-      {showSettings&&<GroupSettingsModal group={group} friends={friends} currentUser={members[0]} onClose={()=>setShowSettings(false)} onUpdate={onUpdate} onLeave={onLeave} onDelete={onDelete}/>}
+      {selectedBill && (
+        <BillDetailModal 
+          bill={selectedBill} 
+          members={members} 
+          onClose={() => setSelectedBill(null)} 
+        />
+      )}
+      {showAddExp&&<AddExpenseModal members={members} memberDetails={group.memberDetails} onAdd={addExpense} onClose={()=>setShowAddExp(false)}/>}
+      {showPay&&<PayModal members={members} memberDetails={group.memberDetails} transactions={transactions} onPay={addPayment} onClose={()=>setShowPay(false)}/>}
+      {showSettings&&<GroupSettingsModal group={group} friends={friends} currentUser={auth.currentUser?.displayName || ""} onClose={()=>setShowSettings(false)} onUpdate={onUpdate} onLeave={onLeave} onDelete={onDelete}/>}
 
       <div style={{background:"linear-gradient(135deg,#7c3aed,#a78bfa)",padding:"12px 16px 0",flexShrink:0}}>
         <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
@@ -770,8 +1454,8 @@ function GroupView({ group, friends, onUpdate, onDelete, onLeave, onBack }: { gr
                 <div style={{textAlign:"center",padding:"12px 0",color:"#94a3b8",fontSize:13}}>{expenses.length===0?"Chưa có hóa đơn nào":"🎉 Mọi người đã huề!"}</div>
               ):transactions.map((t,i)=>(
                 <div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"9px 0",borderBottom:i<transactions.length-1?"1px solid #f3f4f6":"none"}}>
-                  <Av name={t.from} size={32} ci={members.indexOf(t.from)}/>
-                  <div style={{flex:1,fontSize:12,fontWeight:600}}><span style={{color:"#dc2626"}}>{t.from}</span><span style={{color:"#94a3b8"}}> → </span><span style={{color:"#059669"}}>{t.to}</span></div>
+                  <Av name={t.from} size={32} ci={members.indexOf(t.from)} avatar={group.memberDetails?.[t.from]?.avatar}/>
+                  <div style={{flex:1,fontSize:13,fontWeight:700}}><span style={{color:"#dc2626"}}>{t.from}</span> <span style={{color:"#fff", fontWeight: 900, padding: "2px 8px", background: "#ef4444", borderRadius: 12, fontSize: 10, margin: "0 4px"}}>NỢ</span> <span style={{color:"#059669"}}>{t.to}</span></div>
                   <span style={{fontWeight:800,fontSize:14,color:"#7c3aed"}}>{fmt(t.amount)}</span>
                 </div>
               ))}
@@ -786,13 +1470,12 @@ function GroupView({ group, friends, onUpdate, onDelete, onLeave, onBack }: { gr
                 <div style={{display:"flex",alignItems:"center",gap:9}}>
                   <div style={{width:38,height:38,borderRadius:11,background:"#ede9fe",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>🧾</div>
                   <div style={{flex:1}}>
-                    <div style={{fontWeight:700,fontSize:13}}>{e.desc}</div>
+                    <div style={{fontWeight:800,fontSize:14}}>{e.desc}</div>
                     <div style={{fontSize:11,color:"#7c3aed",fontWeight:600}}>
                       {Object.keys(e.payers).filter(k => (e.payers[k] || 0) > 0).join(", ")}
                     </div>
                   </div>
                   <div style={{textAlign:"right"}}><div style={{fontWeight:800,fontSize:13,color:"#db2777"}}>{fmt(e.amount)}</div></div>
-                  <button onClick={ev=>{ev.stopPropagation();removeExpense(e.id);}} style={{background:"#fee2e2",border:"none",color:"#dc2626",borderRadius:7,width:24,height:24,cursor:"pointer",fontWeight:700,fontSize:11}}>×</button>
                 </div>
               </Card>
             ))}
@@ -815,7 +1498,7 @@ function GroupView({ group, friends, onUpdate, onDelete, onLeave, onBack }: { gr
               {members.map((m, i) => (
                 <Card key={i} style={{ padding: "12px 14px", border: m === group.leader ? "1.5px solid #ddd6fe" : "none" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                    <Av name={m} size={42} ci={i} />
+                    <Av name={m} size={42} ci={i} avatar={group.memberDetails?.[m]?.avatar} />
                     <div style={{ flex: 1 }}>
                       <div style={{ fontWeight: 800, fontSize: 15, color: "#1e293b", display: "flex", alignItems: "center", gap: 6 }}>
                         {m}
@@ -906,8 +1589,8 @@ function FriendActionModal({ friend, groups, onClose, onPay }: { friend: Friend,
       </div>
 
       <div style={{ background: friendBalances.netBalance >= 0 ? "#f0fdf4" : "#fef2f2", borderRadius: 16, padding: "16px", marginBottom: 20, textAlign: "center", border: `2px solid ${friendBalances.netBalance >= 0 ? "#bbf7d0" : "#fecaca"}` }}>
-        <div style={{ fontSize: 12, fontWeight: 700, color: friendBalances.netBalance >= 0 ? "#16a34a" : "#dc2626", textTransform: "uppercase", marginBottom: 4 }}>
-          {friendBalances.netBalance >= 0 ? "Người này đang dư" : "Người này đang nợ"}
+        <div style={{ fontSize: 13, fontWeight: 800, color: friendBalances.netBalance >= 0 ? "#16a34a" : "#dc2626", textTransform: "uppercase", marginBottom: 6 }}>
+          {friendBalances.netBalance >= 0 ? "💰 ĐANG DƯ" : "🔴 ĐANG NỢ"}
         </div>
         <div style={{ fontSize: 24, fontWeight: 900, color: friendBalances.netBalance >= 0 ? "#16a34a" : "#dc2626" }}>
           {fmt(Math.abs(friendBalances.netBalance))}
@@ -943,76 +1626,160 @@ function FriendActionModal({ friend, groups, onClose, onPay }: { friend: Friend,
   );
 }
 
-function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick }: { friends: Friend[], groups: Group[], onAddFriend: (f: Friend) => void, onRemoveFriend: (i: number) => void, onPayClick: (g: Group) => void }) {
+function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick }: { friends: Friend[], groups: Group[], onAddFriend: (f: Friend) => void, onRemoveFriend: (id: string) => void, onPayClick: (g: Group) => void }) {
   const [name, setName] = useState("");
-  const [phone, setPhone] = useState("");
   const [email, setEmail] = useState("");
   const [selectedFriend, setSelectedFriend] = useState<Friend | null>(null);
+  const [activeTab, setActiveTab] = useState<"list" | "pending">("list");
 
   const add = () => {
     if (!name.trim()) return;
-    onAddFriend({ name: name.trim(), phone: phone.trim(), email: email.trim() });
+    if (email.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      alert("Email không hợp lệ!");
+      return;
+    }
+    const status = email.trim() ? 'pending' : 'accepted';
+    onAddFriend({ name: name.trim(), email: email.trim(), status, createdAt: Date.now() });
     setName("");
-    setPhone("");
     setEmail("");
+    if (status === 'pending') setActiveTab("pending");
   };
+
+  const acceptedFriends = friends.filter(f => f.status === 'accepted');
+  const pendingFriends = friends.filter(f => f.status === 'pending');
 
   return (
     <div style={{ padding: "12px 14px" }}>
       {selectedFriend && <FriendActionModal friend={selectedFriend} groups={groups} onClose={() => setSelectedFriend(null)} onPay={(g) => { setSelectedFriend(null); onPayClick(g); }} />}
       
-      <Card style={{ padding: "18px" }}>
+      <Card style={{ padding: "18px", marginBottom: 20 }}>
         <SecTitle icon="👥" title="Thêm bạn mới" color="#7c3aed" />
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           <Input placeholder="Họ và tên..." value={name} onChange={(e: any) => setName(e.target.value)} />
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-            <Input placeholder="Số điện thoại" value={phone} onChange={(e: any) => setPhone(e.target.value)} />
-            <Input placeholder="Địa chỉ email" value={email} onChange={(e: any) => setEmail(e.target.value)} />
-          </div>
-          <Btn onClick={add} style={{ marginTop: 4, background: "linear-gradient(135deg,#7c3aed,#a78bfa)" }}>✨ Thêm bạn bè</Btn>
+          <Input placeholder="Địa chỉ email (không bắt buộc)..." value={email} onChange={(e: any) => setEmail(e.target.value)} />
+          <div style={{ fontSize: 11, color: "#64748b", marginTop: -4, marginLeft: 4 }}>* Nhập email để gửi lời mời, hoặc để trống để thêm vào danh sách ngay.</div>
+          <Btn onClick={add} style={{ marginTop: 4, background: "linear-gradient(135deg,#7c3aed,#a78bfa)" }}>✨ {email.trim() ? "Gửi lời mời" : "Thêm ngay"}</Btn>
         </div>
       </Card>
       
-      <div style={{ marginTop: 20, marginBottom: 12, fontSize: 13, fontWeight: 700, color: "rgba(255,255,255,0.9)", display: "flex", alignItems: "center", gap: 6 }}>
-        <span>Danh sách bạn ({friends.length})</span>
-        <div style={{ flex: 1, height: 1, background: "rgba(255,255,255,0.2)" }} />
+      {/* TABS */}
+      <div style={{ display: "flex", background: "rgba(255,255,255,0.1)", backdropFilter: "blur(8px)", borderRadius: 16, padding: 5, marginBottom: 20, border: "1px solid rgba(255,255,255,0.1)" }}>
+        <button 
+          onClick={() => setActiveTab("list")}
+          style={{ 
+            flex: 1, 
+            padding: "10px", 
+            borderRadius: 12, 
+            border: "none", 
+            fontSize: 13, 
+            fontWeight: 800, 
+            cursor: "pointer", 
+            transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)", 
+            background: activeTab === "list" ? "rgba(255,255,255,0.95)" : "transparent", 
+            color: activeTab === "list" ? "#7c3aed" : "rgba(255,255,255,0.8)",
+            boxShadow: activeTab === "list" ? "0 4px 12px rgba(0,0,0,0.1)" : "none",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 6
+          }}
+        >
+          <span>👥 Bạn bè</span>
+          <span style={{ fontSize: 10, background: activeTab === "list" ? "#7c3aed" : "rgba(255,255,255,0.2)", color: "#fff", padding: "1px 6px", borderRadius: 8 }}>{acceptedFriends.length}</span>
+        </button>
+        <button 
+          onClick={() => setActiveTab("pending")}
+          style={{ 
+            flex: 1, 
+            padding: "10px", 
+            borderRadius: 12, 
+            border: "none", 
+            fontSize: 13, 
+            fontWeight: 800, 
+            cursor: "pointer", 
+            transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)", 
+            background: activeTab === "pending" ? "rgba(255,255,255,0.95)" : "transparent", 
+            color: activeTab === "pending" ? "#7c3aed" : "rgba(255,255,255,0.8)",
+            boxShadow: activeTab === "pending" ? "0 4px 12px rgba(0,0,0,0.1)" : "none",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 6
+          }}
+        >
+          <span>⏳ Đang chờ</span>
+          <span style={{ fontSize: 10, background: activeTab === "pending" ? "#f59e0b" : "rgba(255,255,255,0.2)", color: "#fff", padding: "1px 6px", borderRadius: 8 }}>{pendingFriends.length}</span>
+        </button>
       </div>
 
-      {friends.map((f, i) => (
-        <Card key={i} onClick={() => setSelectedFriend(f)} style={{ padding: "12px 14px", marginBottom: 7, cursor: "pointer" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <Av name={f.name} size={42} ci={i} />
-            <div style={{ flex: 1 }}>
-              <div style={{ fontWeight: 700, fontSize: 14 }}>{f.name}</div>
-              <div style={{ fontSize: 11, color: "#94a3b8", display: "flex", flexWrap: "wrap", gap: "4px 8px" }}>
-                {f.phone && <span>📞 {f.phone}</span>}
-                {f.email && <span>✉️ {f.email}</span>}
+      {activeTab === "list" ? (
+        <>
+          {acceptedFriends.map((f, i) => (
+            <Card key={f.id || i} onClick={() => setSelectedFriend(f)} style={{ padding: "12px 14px", marginBottom: 7, cursor: "pointer" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <Av name={f.name} size={42} ci={i} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{f.name}</div>
+                  {f.email && <div style={{ fontSize: 11, color: "#94a3b8" }}>✉️ {f.email}</div>}
+                </div>
+                <button onClick={(e) => { e.stopPropagation(); if(confirm("Xóa người bạn này?") && f.id) onRemoveFriend(f.id); }} style={{ background: "#fef2f2", border: "none", color: "#dc2626", borderRadius: 8, width: 32, height: 32, cursor: "pointer", fontWeight: 700, fontSize: 16 }}>×</button>
               </div>
-            </div>
-            <button onClick={(e) => { e.stopPropagation(); onRemoveFriend(i); }} style={{ background: "#fef2f2", border: "none", color: "#dc2626", borderRadius: 8, width: 32, height: 32, cursor: "pointer", fontWeight: 700, fontSize: 16 }}>×</button>
-          </div>
-        </Card>
-      ))}
-      {friends.length === 0 && <div style={{ textAlign: "center", padding: "60px 20px", color: "rgba(255,255,255,0.6)", fontSize: 14 }}>Bạn chưa có người bạn nào.</div>}
+            </Card>
+          ))}
+          {acceptedFriends.length === 0 && <div style={{ textAlign: "center", padding: "40px 20px", color: "rgba(255,255,255,0.6)", fontSize: 14 }}>Bạn chưa có người bạn nào.</div>}
+        </>
+      ) : (
+        <>
+          {pendingFriends.map((f, i) => (
+            <Card key={f.id || i} style={{ padding: "12px 14px", marginBottom: 7, opacity: 0.9 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <Av name={f.name} size={42} ci={i + acceptedFriends.length} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 700, fontSize: 14, color: "#64748b" }}>{f.name}</div>
+                  <div style={{ fontSize: 11, color: "#94a3b8", display: "flex", alignItems: "center", gap: 6 }}>
+                    <span>✉️ {f.email}</span>
+                  </div>
+                </div>
+                <button onClick={(e) => { e.stopPropagation(); if(confirm("Hủy lời mời này?") && f.id) onRemoveFriend(f.id); }} style={{ background: "#fef2f2", border: "none", color: "#dc2626", borderRadius: 8, width: 32, height: 32, cursor: "pointer", fontWeight: 700, fontSize: 16 }}>×</button>
+              </div>
+            </Card>
+          ))}
+          {pendingFriends.length === 0 && <div style={{ textAlign: "center", padding: "40px 20px", color: "rgba(255,255,255,0.6)", fontSize: 14 }}>Không có lời mời nào đang chờ.</div>}
+        </>
+      )}
     </div>
   );
 }
 
-function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { groups: Group[], friends: Friend[], onSelectGroup: (g: Group) => void, onCreateGroup: (g: Group) => void, onJoinGroup: () => void }) {
+function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { groups: Group[], friends: Friend[], onSelectGroup: (g: Group) => void, onCreateGroup: (g: Group, invites: string[]) => void, onJoinGroup: () => void }) {
   const [showCreate,setShowCreate] = useState(false);
   const [showJoin,setShowJoin] = useState(false);
   const [gName,setGName] = useState(""); const [gEmoji,setGEmoji] = useState("🎉");
-  const [selMembers,setSelMembers] = useState<string[]>([]);
+  const [emails,setEmails] = useState<string[]>([]);
   const [joinCode,setJoinCode] = useState("");
 
-  const toggleMember = (m: string) => setSelMembers(s=>s.includes(m)?s.filter(x=>x!==m):[...s,m]);
-
-  const canCreate = friends.length > 0;
+  const toggleEmail = (email: string) => setEmails(s=>s.includes(email)?s.filter(x=>x!==email):[...s,email]);
 
   const createGroup = () => {
-    if(!gName.trim() || !canCreate) return;
-    onCreateGroup({id:String(Date.now()),name:gName.trim(),emoji:gEmoji,members:selMembers,memberUids:[],leader:selMembers[0]||"Trưởng nhóm",expenses:[],payments:[],feed:[{id:String(Date.now()),type:"group",text:`Nhóm "${gName.trim()}" được tạo`,ts:Date.now(),icon:"🎉"}],inviteCode:genCode(),dueDate:""});
-    setGName("");setSelMembers([]);setShowCreate(false);
+    if(!gName.trim()) {
+      alert("Vui lòng nhập tên nhóm!");
+      return;
+    }
+    onCreateGroup({
+      id:String(Date.now()),
+      name:gName.trim(),
+      emoji:gEmoji,
+      members:[], // Members will be added as they accept invitations
+      memberUids:[],
+      leader: auth.currentUser?.displayName || "Trưởng nhóm",
+      leaderUid: auth.currentUser?.uid || "",
+      expenses:[],
+      payments:[],
+      feed:[{id:String(Date.now()),type:"group",text:`Nhóm "${gName.trim()}" được tạo`,ts:Date.now(),icon:"🎉"}],
+      inviteCode:genCode(),
+      dueDate:""
+    }, emails);
+    setGName("");setEmails([]);setShowCreate(false);
   };
 
   const joinGroup = () => {
@@ -1030,47 +1797,63 @@ function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { gro
           <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
             {EMOJIS.map(e=><button key={e} onClick={()=>setGEmoji(e)} style={{width:38,height:38,borderRadius:9,fontSize:20,border:gEmoji===e?"2.5px solid #7c3aed":"2px solid #e2e8f0",background:gEmoji===e?"#f5f3ff":"#fff",cursor:"pointer"}}>{e}</button>)}
           </div>
-          <Input placeholder="Tên nhóm..." value={gName} onChange={(e: any)=>setGName(e.target.value)} style={{marginBottom:10}}/>
+          <Input placeholder="Tên nhóm..." value={gName} onChange={(e: any)=>setGName(e.target.value)} style={{marginBottom:15}}/>
           
-          <div style={{fontWeight:700,fontSize:12,color:"#64748b",marginBottom:8}}>CHỌN THÀNH VIÊN ({selMembers.length})</div>
-          <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12,maxHeight:150,overflowY:"auto"}}>
-            {friends.map((f,i)=>(
-              <button key={i} onClick={()=>toggleMember(f.name)} style={{display:"flex",alignItems:"center",gap:5,padding:"5px 10px 5px 5px",borderRadius:18,border:`2px solid ${selMembers.includes(f.name)?"#7c3aed":"#e2e8f0"}`,background:selMembers.includes(f.name)?"#f5f3ff":"#fff",cursor:"pointer"}}>
-                <Av name={f.name} size={22} ci={i}/><span style={{fontSize:12,fontWeight:600,color:selMembers.includes(f.name)?"#7c3aed":"#374151"}}>{f.name}</span>
+          <div style={{fontWeight:700,fontSize:12,color:"#64748b",marginBottom:8}}>MỜI NHANH TỪ BẠN BÈ</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", maxHeight: 80, overflowY: "auto", background: "#f8fafc", padding: 8, borderRadius: 8, border: "1px solid #e2e8f0", marginBottom: 15 }}>
+            {friends.filter(f => f.email && !emails.includes(f.email)).map((f, i) => (
+              <button key={i} onClick={() => { setEmails([...emails, f.email!]); }} style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 8px", borderRadius: 12, border: "1px solid #7c3aed", background: "#fff", cursor: "pointer", fontSize: 11, fontWeight: 600, color: "#7c3aed" }}>
+                {f.name} ({f.email})
               </button>
             ))}
-            {friends.length === 0 && <div style={{fontSize:11,color:"#94a3b8"}}>Bạn chưa có bạn bè nào. Hãy thêm tên bên dưới.</div>}
+            {friends.filter(f => f.email && !emails.includes(f.email)).length === 0 && <div style={{ fontSize: 10, color: "#94a3b8" }}>Không có bạn bè mới có email để mời nhanh.</div>}
           </div>
 
-          <div style={{display:"flex",gap:6,marginBottom:12}}>
+          <div style={{fontWeight:700,fontSize:12,color:"#64748b",marginBottom:8}}>MỜI BẠN BÈ QUA EMAIL ({emails.length})</div>
+          <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12,maxHeight:150,overflowY:"auto",background:"#f8fafc",padding:10,borderRadius:12,border:"1px solid #e2e8f0"}}>
+            {emails.map((email, i) => (
+              <div key={i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:"#fff",padding:"8px 12px",borderRadius:10,border:"1px solid #f1f5f9"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <div style={{width:24,height:24,borderRadius:"50%",background:"#ede9fe",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12}}>📧</div>
+                  <span style={{fontSize:13,fontWeight:600}}>{email}</span>
+                </div>
+                <button onClick={() => toggleEmail(email)} style={{background:"none",border:"none",color:"#dc2626",fontSize:18,cursor:"pointer"}}>×</button>
+              </div>
+            ))}
+            {emails.length === 0 && <div style={{fontSize:11,color:"#94a3b8",textAlign:"center",padding:10}}>Chưa có lời mời nào. Thêm email bên dưới!</div>}
+          </div>
+
+          <div style={{display:"flex",gap:6,marginBottom:15}}>
             <Input 
-              placeholder="Thêm tên khác..." 
-              id="new-member-input"
+              placeholder="Nhập email người bạn..." 
+              id="new-member-email"
               onKeyDown={(e: any) => {
                 if (e.key === "Enter") {
                   const val = e.target.value.trim();
-                  if (val && !selMembers.includes(val)) {
-                    setSelMembers([...selMembers, val]);
+                  if (val && !emails.includes(val) && val.includes("@")) {
+                    setEmails([...emails, val]);
                     e.target.value = "";
                   }
                 }
               }}
-              style={{fontSize:12, flex:1}}
+              style={{fontSize:13, flex:1}}
             />
             <button 
               onClick={() => {
-                const input = document.getElementById("new-member-input") as HTMLInputElement;
+                const input = document.getElementById("new-member-email") as HTMLInputElement;
                 const val = input?.value.trim();
-                if (val && !selMembers.includes(val)) {
-                  setSelMembers([...selMembers, val]);
+                if (val && !emails.includes(val) && val.includes("@")) {
+                  setEmails([...emails, val]);
                   input.value = "";
                 }
               }}
-              style={{background:"#f1f5f9",border:"none",borderRadius:10,padding:"0 15px",fontWeight:700,fontSize:18,cursor:"pointer"}}
+              style={{background:"#7c3aed",color:"#fff",border:"none",borderRadius:10,padding:"0 15px",fontWeight:700,fontSize:18,cursor:"pointer"}}
             >+</button>
           </div>
 
-          <Btn onClick={createGroup} style={{width:"100%"}}>✨ Tạo nhóm</Btn>
+          <div style={{fontSize:11, color:"#94a3b8", marginBottom:15, fontStyle:"italic"}}>* Hệ thống sẽ gửi email mời tham gia nhóm tới tất cả địa chỉ trên sau khi bạn tạo nhóm.</div>
+
+          <Btn onClick={createGroup} style={{width:"100%", padding:"14px", fontSize: 14}}>✨ Tạo nhóm ngay</Btn>
         </Modal>
       )}
       {showJoin&&(
@@ -1083,8 +1866,8 @@ function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { gro
 
       <div style={{display:"flex",gap:8,marginBottom:12}}>
         <button 
-          onClick={()=>canCreate ? setShowCreate(true) : alert("Bạn cần có ít nhất 1 người bạn để tạo nhóm!")} 
-          style={{flex:1,background:canCreate ? "linear-gradient(135deg,#7c3aed,#a78bfa)" : "#cbd5e1",color:"#fff",border:"none",borderRadius:12,padding:"11px",fontWeight:700,fontSize:13,cursor:canCreate ? "pointer" : "not-allowed"}}
+          onClick={() => setShowCreate(true)} 
+          style={{flex:1,background:"linear-gradient(135deg,#7c3aed,#a78bfa)",color:"#fff",border:"none",borderRadius:12,padding:"11px",fontWeight:700,fontSize:13,cursor:"pointer"}}
         >
           ✨ Tạo nhóm
         </button>
@@ -1118,6 +1901,14 @@ function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { gro
   );
 }
 
+interface UserProfile {
+  uid: string;
+  name: string;
+  avatar: string;
+  email: string;
+  createdAt: number;
+}
+
 interface UserPrefs {
   emailOnPayment: boolean;
   emailOnDebtReminder: boolean;
@@ -1137,40 +1928,56 @@ const DEFAULT_PREFS: UserPrefs = {
 export default function App() {
   const [tab, setTab] = useState("groups");
   const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [showOnboarding, setShowOnboarding] = useState(false);
   const [userPrefs, setUserPrefs] = useState<UserPrefs>(DEFAULT_PREFS);
   const [groups, setGroups] = useState<Group[]>([]);
   const [friends, setFriends] = useState<Friend[]>([]);
+  const [pendingInvites, setPendingInvites] = useState<Invitation[]>([]);
   const [activeGroup, setActiveGroup] = useState<Group | null>(null);
   const [loading, setLoading] = useState(true);
+  const [inviteId, setInviteId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const id = params.get("inviteId");
+    if (id) setInviteId(id);
+  }, []);
   
   // Security & Profile state (Passcode might need to be in Firestore too, but let's keep it simple for now)
   const [passcode, setPasscode] = useState("");
   const [isLocked, setIsLocked] = useState(false);
   const [enteredPass, setEnteredPass] = useState("");
   const [profilePic, setProfilePic] = useState<string | null>(null);
+  const [showEmailSettings, setShowEmailSettings] = useState(false);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (u) => {
       setUser(u);
       if (u) {
-        // Ensure user document exists
-        const userRef = doc(db, "users", u.uid);
-        const userSnap = await getDoc(userRef);
-        if (!userSnap.exists()) {
-          await setDoc(userRef, {
-            uid: u.uid,
-            name: u.displayName || "User",
-            email: u.email,
-            photoURL: u.photoURL,
-            createdAt: serverTimestamp(),
-            prefs: DEFAULT_PREFS
-          });
-          setUserPrefs(DEFAULT_PREFS);
-        } else {
-          const data = userSnap.data();
-          setUserPrefs(data.prefs || DEFAULT_PREFS);
+        try {
+          const userRef = doc(db, "users", u.uid);
+          const userSnap = await getDoc(userRef);
+          if (userSnap.exists()) {
+            const data = userSnap.data();
+            setProfile({ 
+              uid: u.uid, 
+              name: data.name || u.displayName || "Bạn",
+              avatar: data.avatar || "🐱",
+              email: data.email || u.email || "",
+              createdAt: data.createdAt?.seconds ? data.createdAt.seconds * 1000 : Date.now()
+            });
+            setUserPrefs(data.prefs || DEFAULT_PREFS);
+            setShowOnboarding(false);
+          } else {
+            setShowOnboarding(true);
+          }
+        } catch (err) {
+          console.error("Error fetching user profile:", err);
         }
-        setProfilePic(u.photoURL);
+      } else {
+        setProfile(null);
+        setShowOnboarding(false);
       }
       setLoading(false);
     });
@@ -1178,23 +1985,51 @@ export default function App() {
   }, []);
 
   const deleteAccount = async () => {
-    if (!user) return;
-    if (!window.confirm("BẠN CÓ CHẮC CHẮN MUỐN XÓA TÀI KHOẢN? \nHành động này không thể hoàn tác và tất cả dữ liệu cá nhân của bạn sẽ bị xóa.")) return;
-    
+    const currentUser = auth.currentUser;
+    if (!currentUser) {
+      alert("Không tìm thấy phiên đăng nhập. Vui lòng đăng nhập lại.");
+      return;
+    }
+
+    const confirm = window.confirm("⚠️ CẢNH BÁO TỐI CAO: BẠN SẮP XÓA VĨNH VIỄN TÀI KHOẢN!\n\nHành động này sẽ XÓA SẠCH:\n1. Hồ sơ và danh sách bạn bè\n2. Các nhóm do bạn làm trưởng nhóm (bao gồm tất cả hóa đơn bên trong)\n3. Thông tin đăng nhập của bạn\n\nBạn có chắc chắn 100% muốn xóa toàn bộ dữ liệu và tài khoản này không? (Không thể khôi phục!)");
+    if (!confirm) return;
+
+    alert("⚙️ Hệ thống đang bắt đầu xóa toàn bộ dữ liệu của bạn... Vui lòng không đóng trình duyệt.");
+
     try {
+      setLoading(true);
       // 1. Delete friends
-      const friendsSnap = await getDocs(collection(db, "users", user.uid, "friends"));
+      const friendsSnap = await getDocs(collection(db, "users", currentUser.uid, "friends"));
       for (const d of friendsSnap.docs) await deleteDoc(d.ref);
       
-      // 2. Delete user doc
-      await deleteDoc(doc(db, "users", user.uid));
+      // 2. Delete groups where user is leader
+      const groupsSnap = await getDocs(query(collection(db, "groups"), where("leaderUid", "==", currentUser.uid)));
+      for (const d of groupsSnap.docs) {
+        // Delete subcollections first (expenses, payments, feed)
+        const subcoll = ["expenses", "payments", "feed"];
+        for (const sc of subcoll) {
+          const snap = await getDocs(collection(db, "groups", d.id, sc));
+          for (const sd of snap.docs) await deleteDoc(sd.ref);
+        }
+        await deleteDoc(d.ref);
+      }
+
+      // 3. Delete invitations sent by user
+      const invitesSnap = await getDocs(query(collection(db, "invitations"), where("email", "==", currentUser.email)));
+      for (const d of invitesSnap.docs) await deleteDoc(d.ref);
+
+      // 4. Delete user doc
+      await deleteDoc(doc(db, "users", currentUser.uid));
       
-      // 3. Delete auth user (might require recent login)
-      await user.delete();
-      alert("Tài khoản đã được xóa!");
+      // 5. Delete auth user (might require recent login)
+      const email = currentUser.email;
+      await currentUser.delete();
+      alert(`Tài khoản (${email}) và toàn bộ dữ liệu đã được xóa sạch khỏi hệ thống!`);
+      window.location.reload();
     } catch (err: any) {
+      setLoading(false);
       if (err.code === 'auth/requires-recent-login') {
-        alert("Vui lòng đăng nhập lại trước khi xóa tài khoản để bảo mật.");
+        alert("🔒 Vì lý do bảo mật, bạn cần đăng nhập lại trước khi xóa tài khoản.");
         await logout();
       } else {
         handleFirestoreError(err, OperationType.DELETE, "account");
@@ -1223,7 +2058,7 @@ export default function App() {
     // Sync friends
     const friendsRef = collection(db, "users", user.uid, "friends");
     const unsubFriends = onSnapshot(friendsRef, (snap) => {
-      setFriends(snap.docs.map(d => d.data() as Friend));
+      setFriends(snap.docs.map(d => ({ ...d.data(), id: d.id } as Friend)));
     }, err => handleFirestoreError(err, OperationType.LIST, "friends"));
 
     // Sync groups where user is a member
@@ -1233,9 +2068,20 @@ export default function App() {
       setGroups(snap.docs.map(d => ({ ...d.data(), id: d.id } as any)));
     }, err => handleFirestoreError(err, OperationType.LIST, "groups"));
 
+    // Sync pending invitations for current user email
+    let unsubInvites = () => {};
+    if (user.email) {
+      const invitesRef = collection(db, "invitations");
+      const invitesQuery = query(invitesRef, where("email", "==", user.email));
+      unsubInvites = onSnapshot(invitesQuery, (snap) => {
+        setPendingInvites(snap.docs.map(d => ({ ...d.data(), id: d.id } as Invitation)));
+      }, err => handleFirestoreError(err, OperationType.LIST, "pending invitations"));
+    }
+
     return () => {
       unsubFriends();
       unsubGroups();
+      unsubInvites();
     };
   }, [user]);
 
@@ -1284,49 +2130,78 @@ export default function App() {
   };
 
   const addFriend = async (f: Friend) => {
-    if (!user) return;
+    if (!user || !profile) return;
+    if (f.email === user.email) {
+      alert("Bạn không thể tự mời chính mình!");
+      return;
+    }
     try {
       await addDoc(collection(db, "users", user.uid, "friends"), f);
+      if (f.email) {
+        console.log(`[FRIEND INVITE SIMULATION] To: ${f.email} | Body: ${profile.name} invited you to join HappyShare!`);
+        // In a real app, send actual email here
+      }
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, "friends");
     }
   };
 
-  const removeFriend = async (i: number) => {
-    // This is a bit tricky with indexes. We should ideally have friend IDs.
-    // For now, let's find the doc by name or just use the list.
+  const removeFriend = async (id: string) => {
     if (!user) return;
-    const f = friends[i];
-    const friendsRef = collection(db, "users", user.uid, "friends");
-    const q = query(friendsRef, where("name", "==", f.name));
-    const snap = await getDocs(q);
-    snap.forEach(async (d) => await deleteDoc(d.ref));
+    try {
+      await deleteDoc(doc(db, "users", user.uid, "friends", id));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, "friends");
+    }
   };
 
-  const createGroup = async (g: any) => {
+  const saveProfile = async (p: { name: string; avatar: string }) => {
     if (!user) return;
+    try {
+      const profileData = {
+        uid: user.uid,
+        name: p.name,
+        avatar: p.avatar,
+        email: user.email || "",
+        createdAt: Date.now(),
+        prefs: userPrefs
+      };
+      await setDoc(doc(db, "users", user.uid), profileData);
+      setProfile(profileData as UserProfile);
+      setShowOnboarding(false);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, "users");
+    }
+  };
+
+  const createGroup = async (g: any, invites: string[]) => {
+    if (!user || !profile) return;
+    const filteredInvites = invites.filter(e => e !== user.email);
     try {
       const groupData = {
         ...g,
-        memberUids: [user.uid, ...selMemberUids(g.members)], // This needs logic to map names to UIDs if possible, or just user.uid
+        members: [profile.name],
+        memberUids: [user.uid],
+        leader: profile.name,
+        leaderUid: user.uid,
         createdBy: user.uid,
         createdAt: serverTimestamp()
       };
-      delete groupData.expenses;
-      delete groupData.payments;
-      delete groupData.feed;
       delete groupData.id;
-
-      // Ensure user is in memberUids
-      if (!groupData.memberUids.includes(user.uid)) {
-        groupData.memberUids.push(user.uid);
-      }
-      if (!groupData.members.includes(user.displayName || "Bạn")) {
-        groupData.members.push(user.displayName || "Bạn");
-      }
 
       const docRef = await addDoc(collection(db, "groups"), groupData);
       
+      // Create Invitations
+      for (const email of filteredInvites) {
+        const invDoc = await addDoc(collection(db, "invitations"), {
+          groupId: docRef.id,
+          inviterName: profile.name,
+          email,
+          ts: Date.now()
+        });
+        sendEmailInvite(email, profile.name, g.name, invDoc.id);
+      }
+
       // Add initial feed
       await addDoc(collection(db, "groups", docRef.id, "feed"), {
         type: "group",
@@ -1335,6 +2210,7 @@ export default function App() {
         icon: "🎉"
       });
 
+      setActiveGroup({ ...groupData, id: docRef.id, leaderUid: user.uid });
       setTab("active");
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, "groups");
@@ -1349,10 +2225,35 @@ export default function App() {
 
   const selectGroup = (g: Group) => { setActiveGroup(g); setTab("active"); };
 
-  const tabs=[
-    {id:"groups",icon:"🏠",label:"Nhóm"},
-    {id:"friends",icon:"👥",label:"Bạn bè"},
-    {id:"settings",icon:"⚙️",label:"Cài đặt"},
+  const addExpenseToGroup = async (groupId: string, exp: any) => {
+    try {
+      const g = groups.find(x => x.id === groupId);
+      const { id, ...data } = exp;
+      await addDoc(collection(db, "groups", groupId, "expenses"), { 
+        ...data, 
+        createdBy: auth.currentUser?.uid,
+        memberDetails: g?.memberDetails || {}
+      });
+      const mainPayer = Object.keys(exp.payers).find(k => (exp.payers[k] || 0) > 0) || "Ai đó";
+      await addDoc(collection(db, "groups", groupId, "feed"), {
+        type: "expense",
+        text: `${mainPayer} đã quét hoá đơn "${exp.desc}" — ${fmt(exp.amount)}`,
+        ts: Date.now(),
+        icon: "📷",
+        name: mainPayer
+      });
+      setTab("active");
+      setActiveGroup(groups.find(g => g.id === groupId) || null);
+    } catch(err) {
+      handleFirestoreError(err, OperationType.CREATE, `groups/${groupId}/expenses`);
+    }
+  };
+
+  const tabs = [
+    { id: "groups", icon: "🏠", label: "Nhóm" },
+    { id: "friends", icon: "👥", label: "Bạn bè" },
+    { id: "qr", icon: <Receipt size={20} strokeWidth={2.5} />, label: "Quét bill" },
+    { id: "settings", icon: "⚙️", label: "Cài đặt" },
   ];
 
   const handlePicUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1377,6 +2278,22 @@ export default function App() {
       <div style={{minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", background:"#4c1d95", color:"#fff"}}>
          <div style={{fontSize: 24, fontWeight: 700}}>Đang tải...</div>
       </div>
+    );
+  }
+
+  if (inviteId) {
+    return (
+      <JoinGroupView 
+        inviteId={inviteId} 
+        profile={profile}
+        onJoined={(g) => {
+          setInviteId(null);
+          setActiveGroup(g);
+          setTab("active");
+          // Clear URL params
+          window.history.replaceState({}, document.title, window.location.pathname);
+        }} 
+      />
     );
   }
 
@@ -1414,7 +2331,63 @@ export default function App() {
   }
 
   return (
-    <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",background:"linear-gradient(135deg,#4c1d95 0%,#7c3aed 40%,#a78bfa 100%)",fontFamily:"system-ui"}}>
+    <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",background:"linear-gradient(135deg,#4c1d95 0%,#7c3aed 40%,#a78bfa 100%)"}}>
+      {showOnboarding && (
+        <Modal onClose={() => {}}>
+          <div style={{ textAlign: "center", padding: "20px 0" }}>
+            <div style={{ fontSize: 48, marginBottom: 16 }}>👋</div>
+            <div style={{ fontWeight: 900, fontSize: 20, marginBottom: 8, color: "#1e293b" }}>Chào mừng bạn!</div>
+            <div style={{ fontSize: 14, color: "#64748b", marginBottom: 24 }}>Vui lòng hoàn tất hồ sơ để bắt đầu sử dụng.</div>
+            
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "#475569", textAlign: "left", marginBottom: 6 }}>Tên hiển thị</div>
+              <input 
+                placeholder="Nhập tên của bạn..." 
+                defaultValue={user?.displayName || ""} 
+                id="onboarding-name"
+                style={{ width: "100%", padding: "12px", borderRadius: 10, border: "1px solid #e2e8f0", background: "#fff", outline: "none" }}
+              />
+            </div>
+
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "#475569", textAlign: "left", marginBottom: 12 }}>Chọn Avatar</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "center" }}>
+                {["🐱", "🐶", "🦊", "🐻", "🐼", "🦁", "🐧", "🦄"].map(av => (
+                  <button 
+                    key={av}
+                    onClick={() => {
+                      const btns = document.querySelectorAll('.av-choice');
+                      btns.forEach(b => (b as HTMLElement).style.border = "2px solid #f1f5f9");
+                      const btn = document.getElementById(`av-${av}`);
+                      if (btn) btn.style.border = "2px solid #7c3aed";
+                      (window as any)._selectedAvatar = av;
+                    }}
+                    id={`av-${av}`}
+                    className="av-choice"
+                    style={{ width: 44, height: 44, borderRadius: 12, background: "#fff", border: "2px solid #f1f5f9", fontSize: 20, cursor: "pointer", transition: "all 0.2s" }}
+                  >
+                    {av}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <Btn 
+              onClick={() => {
+                const nameInput = document.getElementById("onboarding-name") as HTMLInputElement;
+                const name = nameInput.value.trim();
+                const avatar = (window as any)._selectedAvatar || "🐱";
+                if (!name) { alert("Vui lòng nhập tên!"); return; }
+                saveProfile({ name, avatar });
+              }} 
+              style={{ width: "100%", padding: "14px" }}
+            >
+              🚀 Bắt đầu ngay
+            </Btn>
+          </div>
+        </Modal>
+      )}
+
       {/* HEADER */}
       <div style={{padding:"20px 20px 15px", background: "rgba(0,0,0,0.15)", borderBottom: "1px solid rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "space-between"}}>
         <div 
@@ -1435,11 +2408,36 @@ export default function App() {
       </div>
 
       <div style={{flex:1,overflowY:"auto",paddingBottom:70}}>
-        {tab==="groups"&&<GroupsListView groups={groups} friends={friends} onSelectGroup={selectGroup} onCreateGroup={createGroup} onJoinGroup={()=>{}}/>}
+        {tab==="groups"&& (
+          <>
+            {pendingInvites.length > 0 && (
+              <div style={{ padding: "12px 14px 0" }}>
+                <div style={{ fontWeight: 800, fontSize: 13, color: "rgba(255,255,255,0.9)", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
+                  <span>💌 LỜI MỜI MỚI ({pendingInvites.length})</span>
+                  <div style={{ flex: 1, height: 1, background: "rgba(255,255,255,0.2)" }} />
+                </div>
+                {pendingInvites.map(inv => (
+                  <Card key={inv.id} style={{ padding: "12px 14px", marginBottom: 8, background: "rgba(255,255,255,0.95)", borderLeft: "4px solid #db2777" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                      <div style={{ width: 40, height: 40, borderRadius: 12, background: "#fce7f3", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>🧧</div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 12, color: "#64748b" }}><b>{inv.inviterName}</b> mời bạn tham gia</div>
+                        <div style={{ fontWeight: 800, fontSize: 14, color: "#be185d" }}>Nhóm chi tiêu mới</div>
+                      </div>
+                      <Btn onClick={() => setInviteId(inv.id)} style={{ padding: "6px 12px", fontSize: 12, background: "#db2777" }}>Xem & Tham gia</Btn>
+                    </div>
+                  </Card>
+                ))}
+              </div>
+            )}
+            <GroupsListView groups={groups} friends={friends} onSelectGroup={selectGroup} onCreateGroup={createGroup} onJoinGroup={()=>{}}/>
+          </>
+        )}
         {tab==="active"&&activeGroup&&(
           <GroupView group={groups.find(g=>g.id===activeGroup.id)||activeGroup} friends={friends} onUpdate={updateGroup} onDelete={()=>deleteGroup(activeGroup)} onLeave={()=>leaveGroup(activeGroup)} onBack={() => setTab("groups")}/>
         )}
         {tab==="friends"&&<FriendsView friends={friends} groups={groups} onAddFriend={addFriend} onRemoveFriend={removeFriend} onPayClick={(g) => selectGroup(g)}/>}
+        {tab==="qr" && <ReceiptScannerView groups={groups} onAddExpense={addExpenseToGroup} />}
         {tab==="settings" && (
           <div style={{padding:14}}>
             {/* Account Settings */}
@@ -1484,51 +2482,32 @@ export default function App() {
                </div>
 
                <div>
-                 <div style={{fontSize:12, fontWeight:700, color:"#64748b", textTransform:"uppercase", letterSpacing:1, marginBottom:10}}>Thông báo Email</div>
-                 {[
-                   { id: "emailOnPayment", label: "Có người trả tiền", desc: "Nhận mail khi có thành viên thanh toán trong nhóm" },
-                   { id: "emailOnDebtReminder", label: "Nhắc nợ", desc: "Nhận mail khi có người yêu cầu bạn trả tiền" },
-                   { id: "emailOnAddedToGroup", label: "Được thêm vào nhóm", desc: "Nhận mail khi bạn trở thành thành viên nhóm mới" },
-                   { id: "emailOnAddedAsFriend", label: "Kết bạn mới", desc: "Nhận mail khi ai đó lưu bạn vào danh sách bạn" },
-                   { id: "emailOnMonthlyReport", label: "Báo cáo tháng", desc: "Bản tin tổng hợp chi tiêu cuối mỗi tháng" }
-                 ].map((item) => (
-                   <div key={item.id} style={{display:"flex", alignItems:"center", justifyContent:"space-between", padding:"10px 0", borderBottom:"1px solid #f1f5f9"}}>
-                      <div style={{flex:1, marginRight:12}}>
-                         <div style={{fontSize:14, fontWeight:600, color:"#334155"}}>{item.label}</div>
-                         <div style={{fontSize:10, color:"#94a3b8"}}>{item.desc}</div>
-                      </div>
-                      <div 
-                        onClick={() => updatePrefs({ [item.id]: !((userPrefs as any)[item.id]) })}
-                        style={{
-                          width: 44, height: 24, borderRadius: 12, background: (userPrefs as any)[item.id] ? "#7c3aed" : "#e2e8f0",
-                          position: "relative", cursor: "pointer", transition: "0.2s"
-                        }}
-                      >
-                         <div style={{
-                           width: 18, height: 18, borderRadius: "50%", background: "#fff",
-                           position: "absolute", top: 3, left: (userPrefs as any)[item.id] ? 23 : 3,
-                           transition: "0.2s", boxShadow: "0 2px 4px rgba(0,0,0,0.1)"
-                         }}/>
-                      </div>
-                   </div>
-                 ))}
+                 <div 
+                   onClick={() => setShowEmailSettings(true)} 
+                   style={{display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", padding: "10px 0"}}
+                 >
+                   <div style={{fontSize:12, fontWeight:700, color:"#64748b", textTransform:"uppercase", letterSpacing:1}}>Thông báo Email</div>
+                 </div>
                </div>
             </Card>
+
+            {showEmailSettings && <EmailSettingsModal prefs={userPrefs} onUpdate={updatePrefs} onClose={() => setShowEmailSettings(false)} />}
 
             {/* Hệ thống */}
             <Card>
                <SecTitle icon="🚪" title="Hệ thống" color="#374151"/>
                <div style={{display:"flex", gap:8}}>
                  <Btn onClick={logout} color="#374151" style={{flex:1, fontSize:12, padding:"10px"}}>Đăng xuất</Btn>
-                 <button 
-                   onClick={deleteAccount}
-                   style={{
-                     flex:1, padding:"10px", borderRadius:12, border:"1px solid #fee2e2", 
-                     background:"#fff", color:"#ef4444", fontSize:11, fontWeight:700, cursor:"pointer"
+                 <Btn 
+                   onClick={() => {
+                     console.log("Delete account button clicked");
+                     deleteAccount();
                    }}
+                   color="#fecaca" 
+                   style={{flex:1, color:"#991b1b", fontSize:11, border:"1.5px solid #dc2626"}}
                  >
-                   🗑️ Xóa TK
-                 </button>
+                   🗑️ Xóa Vĩnh Viễn TK
+                 </Btn>
                </div>
             </Card>
           </div>

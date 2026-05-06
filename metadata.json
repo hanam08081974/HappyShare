@@ -1,6 +1,6 @@
 {
   "name": "HappyShare",
   "description": "HappyShare - A collaborative bill-splitting and expense tracking app for friends and groups with secure passcode protection and profile customization.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["camera"],
   "majorCapabilities": []
 }
