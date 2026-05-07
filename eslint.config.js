@@ -4,7 +4,7 @@ import js from '@eslint/js';
 export default [
   js.configs.recommended,
   {
-    ignores: ['dist/**/*']
+    ignores: ['dist/**/*', 'build/**/*', 'server.js']
   },
   {
     files: ['**/*.rules'],

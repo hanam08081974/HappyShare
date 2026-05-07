@@ -63,18 +63,6 @@
       },
       "required": ["name", "emoji", "members", "leader", "inviteCode", "createdBy"]
     },
-    "Invitation": {
-      "title": "Invitation",
-      "description": "Email invitation to a group",
-      "type": "object",
-      "properties": {
-        "groupId": { "type": "string" },
-        "inviterName": { "type": "string" },
-        "email": { "type": "string" },
-        "ts": { "type": "number" }
-      },
-      "required": ["groupId", "inviterName", "email", "ts"]
-    },
     "Expense": {
       "title": "Expense",
       "description": "A single expense entry",
@@ -127,10 +115,6 @@
     "/users/{userId}/friends/{friendId}": {
       "schema": "Friend",
       "description": "Friend list of a user"
-    },
-    "/invitations/{inviteId}": {
-      "schema": "Invitation",
-      "description": "Group invitations"
     },
     "/groups/{groupId}": {
       "schema": "Group",

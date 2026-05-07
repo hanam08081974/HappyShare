@@ -1,8 +1,8 @@
 import express from "express";
 import nodemailer from "nodemailer";
-import { createServer as createViteServer } from "vite";
 import path from "path";
 import dotenv from "dotenv";
+import fs from "fs";
 
 dotenv.config();
 
@@ -88,6 +88,7 @@ async function startServer() {
   const PORT = 3000;
 
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
@@ -95,6 +96,9 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
+    if (!fs.existsSync(distPath)) {
+      console.error("Production dist directory not found!");
+    }
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));

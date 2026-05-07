@@ -1,10 +1,12 @@
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell, ReferenceLine, AreaChart, Area } from "recharts";
 import React, { useState, useMemo, useEffect, useRef } from "react";
-import { QrCode, Receipt, Upload, Loader2, ImagePlus, Camera } from "lucide-react";
+import { QrCode, Receipt, Upload, Loader2, ImagePlus, Camera, LogOut } from "lucide-react";
 import { initializeApp } from "firebase/app";
-import { getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signOut, User as FirebaseUser } from "firebase/auth";
-import { getFirestore, collection, doc, setDoc, getDoc, getDocs, onSnapshot, query, where, addDoc, updateDoc, deleteDoc, serverTimestamp, getDocFromServer, orderBy } from "firebase/firestore";
+import { getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signOut, User as FirebaseUser, reauthenticateWithPopup } from "firebase/auth";
+import { getFirestore, collection, doc, setDoc, getDoc, getDocs, onSnapshot, query, where, addDoc, updateDoc, deleteDoc, serverTimestamp, getDocFromServer, orderBy, collectionGroup } from "firebase/firestore";
 import { GoogleGenAI, Type } from "@google/genai";
 import firebaseConfig from "../firebase-applet-config.json";
+import QRCode from "react-qr-code";
 
 // Initialize AI
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -71,40 +73,37 @@ async function testConnection() {
     }
   }
 }
-testConnection();
 
 // ─── Constants ───────────────────────────────────────────────
 const COLORS = ["#7C3AED","#2563EB","#DB2777","#D97706","#059669","#DC2626","#0891B2","#9333EA","#EA580C","#0D9488"];
 const EMOJIS = ["🏖️","🍜","🎉","✈️","🏠","🎮","🛒","🍻","🏕️","💼"];
-const fmt = (n: number) => new Intl.NumberFormat("vi-VN",{style:"currency",currency:"VND"}).format(Math.round(n));
-const fmtShort = (n: number) => { if(Math.abs(n)>=1e6) return (n/1e6).toFixed(1)+"tr"; if(Math.abs(n)>=1e3) return (n/1e3).toFixed(0)+"k"; return String(Math.round(n)); };
+const fmt = (n: number) => {
+  const rounded = Math.round(n);
+  return new Intl.NumberFormat("vi-VN", { style: "currency", currency: "VND" }).format(Object.is(rounded, -0) ? 0 : rounded);
+};
+const fmtShort = (n: number) => { 
+  const val = Math.round(n);
+  const abs = Math.abs(val);
+  if (abs >= 1e6) return (val / 1e6).toFixed(1) + "tr"; 
+  if (abs >= 1e3) return (val / 1e3).toFixed(0) + "k"; 
+  return String(Object.is(val, -0) ? 0 : val); 
+};
 const timeAgo = (ts: number) => { const s=Math.floor((Date.now()-ts)/1000); if(s<60)return"vừa xong"; if(s<3600)return`${Math.floor(s/60)}p trước`; if(s<86400)return`${Math.floor(s/3600)}h trước`; return`${Math.floor(s/86400)}d trước`; };
 const genCode = () => Math.random().toString(36).slice(2,8).toUpperCase();
-
-const sendEmailInvite = async (email: string, inviterName: string, groupName: string, inviteId: string) => {
-  try {
-    const inviteLink = `${window.location.origin}/?inviteId=${inviteId}`;
-    const res = await fetch("/api/invite", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, inviterName, groupName, inviteLink }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      if (res.status === 503) {
-        alert("⚠️ Email chưa được gửi: Bạn cần cấu hình SMTP_USER và SMTP_PASS trong phần Settings của AI Studio.");
-      } else {
-        alert("❌ Lỗi gửi email: " + (data.error || "Không xác định"));
-      }
-      return false;
-    }
-    alert("✅ Đã gửi email mời đến: " + email);
-    return true;
-  } catch (err) {
-    console.error("Failed to send email invite:", err);
-    alert("❌ Không thể kết nối với máy chủ gửi email.");
-    return false;
-  }
+// Numeric formatting helpers
+const formatNum = (v: string | number) => {
+  if (v === "" || v === undefined) return "";
+  const n = typeof v === "string" ? v.replace(/\D/g, "") : Math.round(v).toString();
+  if (!n) return "";
+  return new Intl.NumberFormat("vi-VN").format(parseInt(n));
+};
+const parseNum = (v: string) => {
+  const digits = v.replace(/\D/g, "");
+  return digits ? parseInt(digits) : 0;
+};
+const parseNumStr = (v: string) => {
+  const digits = v.replace(/\D/g, "");
+  return digits || "";
 };
 
 // ─── Types ───────────────────────────────────────────────────
@@ -112,6 +111,7 @@ interface Friend {
   id?: string;
   name: string;
   email: string;
+  avatar?: string;
   status: 'pending' | 'accepted';
   createdAt: number;
 }
@@ -130,19 +130,64 @@ interface Expense {
   splitMode: string; // "equal" | "percent" | "adjust" | "itemized"
   splits: Record<string, number>;
   ts: number;
+  category?: string;
   items?: ReceiptItem[]; // For itemized mode
   memberDetails?: Record<string, { phone?: string; email?: string; avatar?: string }>;
 }
 
-interface Invitation {
-  id: string;
-  groupId: string;
-  inviterName: string;
-  email: string;
-  ts: number;
-}
-
 // ─── Utilities ──────────────────────────────────────────────
+const getExpenseSplits = (exp: Expense, members: string[]): Record<string, number> => {
+  const res: Record<string, number> = {};
+  const totalAmount = Math.round(exp.amount);
+  let distributed = 0;
+
+  if (exp.splitMode === "equal") {
+    const base = Math.floor(totalAmount / members.length);
+    const rem = totalAmount % members.length;
+    members.forEach((m, i) => {
+      res[m] = base + (i < rem ? 1 : 0);
+    });
+  } else if (exp.splitMode === "percent") {
+    members.forEach((m, i) => {
+      if (i === members.length - 1) {
+        res[m] = totalAmount - distributed;
+      } else {
+        res[m] = Math.round((exp.splits[m] || 0) / 100 * totalAmount);
+        distributed += res[m];
+      }
+    });
+  } else if (exp.splitMode === "adjust") {
+    const totalAdj = members.reduce((s, m) => s + Math.round(exp.splits[m] || 0), 0);
+    const amountToSplit = totalAmount - totalAdj;
+    const base = Math.floor(amountToSplit / members.length);
+    const rem = amountToSplit % members.length;
+    members.forEach((m, i) => {
+      res[m] = base + (i < rem ? 1 : 0) + Math.round(exp.splits[m] || 0);
+    });
+  } else if (exp.splitMode === "itemized") {
+    members.forEach(m => res[m] = 0);
+    exp.items?.forEach(item => {
+      const p = Math.round(item.price || 0);
+      const targets = item.assignedTo?.length ? item.assignedTo : members;
+      const base = Math.floor(p / targets.length);
+      const rem = p % targets.length;
+      targets.forEach((m, i) => {
+        res[m] = (res[m] || 0) + base + (i < rem ? 1 : 0);
+      });
+    });
+    const allocated = exp.items?.reduce((s, it) => s + Math.round(it.price || 0), 0) || 0;
+    const remaining = totalAmount - allocated;
+    if (remaining !== 0) {
+      const base = Math.floor(remaining / members.length);
+      const rem = remaining % members.length;
+      members.forEach((m, i) => {
+        res[m] = (res[m] || 0) + base + (i < rem ? 1 : 0);
+      });
+    }
+  }
+  return res;
+};
+
 const computeGroupBalances = (group: Group) => {
   const members = group.members;
   const expenses = group.expenses || [];
@@ -150,68 +195,42 @@ const computeGroupBalances = (group: Group) => {
   
   if (!members.length) return { total: 0, balances: {}, transactions: [] };
   
-  const getMemberShare = (exp: Expense, m: string) => {
-    if (exp.splitMode === "equal") return exp.amount / members.length;
-    if (exp.splitMode === "percent") return (exp.splits[m] || 0) / 100 * exp.amount;
-    if (exp.splitMode === "adjust") return exp.amount / members.length + (exp.splits[m] || 0);
-    if (exp.splitMode === "itemized") {
-      let share = 0;
-      exp.items?.forEach(item => {
-        if (item.assignedTo && item.assignedTo.length > 0) {
-          if (item.assignedTo.includes(m)) {
-            share += item.price / item.assignedTo.length;
-          }
-        } else {
-          // If no one is assigned, split this item evenly among all members
-          share += item.price / members.length;
-        }
-      });
-      // Handle remaining amount if any (e.g. tax/tip)
-      const allocated = exp.items?.reduce((sum, it) => sum + (it.price || 0), 0) || 0;
-      const remaining = exp.amount - allocated;
-      if (remaining > 0.01) {
-        share += remaining / members.length; // distribute tax equally among all members
-      }
-      return share;
-    }
-    return 0;
-  };
+  const total = expenses.reduce((s, e) => s + Math.round(e.amount), 0);
+  const adj: Record<string, number> = {};
+  members.forEach(m => adj[m] = 0);
 
-  const total = expenses.reduce((s, e) => s + e.amount, 0);
-  const paid: Record<string, number> = {};
-  members.forEach(m => paid[m] = 0);
   expenses.forEach(e => {
+    const splits = getExpenseSplits(e, members);
+    // Add amounts paid by this member
     Object.entries(e.payers).forEach(([name, amt]) => {
-      if (paid[name] !== undefined) paid[name] += amt as number;
+      if (adj[name] !== undefined) adj[name] += Math.round(amt as number);
+    });
+    // Subtract amounts owed by this member
+    members.forEach(m => {
+      adj[m] -= (splits[m] || 0);
     });
   });
 
-  const adj: Record<string, number> = {};
-  members.forEach(m => {
-    let owed = 0;
-    expenses.forEach(e => { owed += getMemberShare(e, m); });
-    adj[m] = (paid[m] || 0) - owed;
-  });
-
   payments.forEach(p => {
-    if (adj[p.from] !== undefined) adj[p.from] += p.amount;
-    if (adj[p.to] !== undefined) adj[p.to] -= p.amount;
+    const amt = Math.round(p.amount);
+    if (adj[p.from] !== undefined) adj[p.from] += amt;
+    if (adj[p.to] !== undefined) adj[p.to] -= amt;
   });
 
-  const c = members.filter(m => adj[m] > 0.01).map(m => ({ name: m, amt: adj[m] })).sort((a, b) => b.amt - a.amt);
-  const d = members.filter(m => adj[m] < -0.01).map(m => ({ name: m, amt: -adj[m] })).sort((a, b) => b.amt - a.amt);
+  const c = members.filter(m => adj[m] >= 1).map(m => ({ name: m, amt: adj[m] })).sort((a, b) => b.amt - a.amt);
+  const d = members.filter(m => adj[m] <= -1).map(m => ({ name: m, amt: -adj[m] })).sort((a, b) => b.amt - a.amt);
   const txns: any[] = [];
   let ci = 0, di = 0;
   while (ci < c.length && di < d.length) {
     const s = Math.min(c[ci].amt, d[di].amt);
     txns.push({ from: d[di].name, to: c[ci].name, amount: s });
     c[ci].amt -= s;
-    if (c[ci].amt < 0.01) ci++;
+    if (c[ci].amt < 1) ci++;
     d[di].amt -= s;
-    if (d[di].amt < 0.01) di++;
+    if (d[di].amt < 1) di++;
   }
 
-  return { total, balances: adj, transactions: txns };
+  return { total, balances: adj, transactions: txns.filter(t => t.amount >= 1) };
 };
 
 interface Payment {
@@ -251,7 +270,10 @@ interface Group {
 // ─── Tiny Components ─────────────────────────────────────────
 function Av({ name, size=36, ci=0, avatar, style={} }: { name: string, size?: number, ci?: number, avatar?: string, style?: any }) {
   if (avatar) {
-    return <img src={avatar} style={{ width: size, height: size, borderRadius: "50%", objectFit: "cover", flexShrink: 0, ...style }} alt={name} />;
+    if (avatar.startsWith("http") || avatar.startsWith("data:")) {
+      return <img src={avatar} style={{ width: size, height: size, borderRadius: "50%", objectFit: "cover", flexShrink: 0, ...style }} alt={name} />;
+    }
+    return <div style={{width:size,height:size,borderRadius:"50%",background:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontSize:size*0.6,flexShrink:0,boxShadow:"0 2px 8px rgba(0,0,0,0.05)",...style}}>{avatar}</div>;
   }
   const ini = name.trim().split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2);
   return <div style={{width:size,height:size,borderRadius:"50%",background:COLORS[ci%COLORS.length],display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,fontSize:size*.38,flexShrink:0,...style}}>{ini||"?"}</div>;
@@ -259,8 +281,8 @@ function Av({ name, size=36, ci=0, avatar, style={} }: { name: string, size?: nu
 function Card({ children, style={}, onClick }: { children: React.ReactNode, style?: any, onClick?: () => void, key?: any }) {
   return <div onClick={onClick} style={{background:"#fff",borderRadius:16,boxShadow:"0 4px 24px rgba(120,60,220,.10)",padding:"16px",marginBottom:10,...style,cursor:onClick?"pointer":"default"}}>{children}</div>;
 }
-function SecTitle({ icon, title, color, right }: { icon: string, title: string, color: string, right?: React.ReactNode }) {
-  return <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><div style={{width:30,height:30,borderRadius:9,background:color+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15}}>{icon}</div><span style={{fontWeight:700,fontSize:14,color:"#3b1e6e",flex:1}}>{title}</span>{right}</div>;
+function SecTitle({ icon, title, color, right, textColor="#3b1e6e" }: { icon: string, title: string, color: string, right?: React.ReactNode, textColor?: string }) {
+  return <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:12}}><div style={{width:30,height:30,borderRadius:9,background:color+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15}}>{icon}</div><span style={{fontWeight:700,fontSize:14,color:textColor,flex:1}}>{title}</span>{right}</div>;
 }
 function Btn({ children, onClick, color="#7c3aed", disabled=false, style={} }: { children: React.ReactNode, onClick: () => void, color?: string, disabled?: boolean, style?: any }) {
   return <button onClick={onClick} disabled={disabled} style={{background:disabled?"#e2e8f0":color,color:disabled?"#94a3b8":"#fff",border:"none",borderRadius:11,padding:"11px 16px",fontWeight:700,fontSize:13,cursor:disabled?"not-allowed":"pointer",...style}}>{children}</button>;
@@ -269,99 +291,30 @@ function Input({ style={}, ...p }: any) {
   return <input {...p} style={{border:"2px solid #ede9fe",borderRadius:10,padding:"9px 11px",fontSize:13,outline:"none",width:"100%",boxSizing:"border-box",...style}}/>;
 }
 
-// ─── Charts ──────────────────────────────────────────────────
-function PieChart({ data, size=120 }: { data: {value: number, color: string, label: string}[], size?: number }) {
-  if (!data.length) return null;
-  const total = data.reduce((s,d)=>s+d.value,0);
-  if (!total) return null;
-  let angle = -Math.PI/2;
-  const cx=size/2, cy=size/2, r=size/2-4;
-  const slices = data.map(d => {
-    const sweep = (d.value/total)*2*Math.PI;
-    const x1=cx+r*Math.cos(angle), y1=cy+r*Math.sin(angle);
-    angle+=sweep;
-    const x2=cx+r*Math.cos(angle), y2=cy+r*Math.sin(angle);
-    const large=sweep>Math.PI?1:0;
-    return {path:`M${cx},${cy} L${x1},${y1} A${r},${r},0,${large},1,${x2},${y2} Z`, color:d.color, label:d.label, pct:Math.round(d.value/total*100)};
-  });
-  return (
-    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
-      {slices.map((s,i)=><path key={i} d={s.path} fill={s.color} stroke="#fff" strokeWidth={1.5}/>)}
-      <circle cx={cx} cy={cy} r={r*0.45} fill="#fff"/>
-    </svg>
-  );
-}
-function BarChart({ data, maxVal }: { data: {value: number, color: string, label: string}[], maxVal?: number }) {
-  const mv = maxVal || Math.max(...data.map(d=>d.value),1);
-  return (
-    <div style={{display:"flex",alignItems:"flex-end",gap:6,height:80}}>
-      {data.map((d,i)=>(
-        <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
-          <div style={{fontSize:9,fontWeight:700,color:d.color}}>{fmtShort(d.value)}</div>
-          <div style={{width:"100%",background:d.color,borderRadius:"4px 4px 0 0",height:Math.max(4,(d.value/mv)*60),transition:"height .4s"}}/>
-          <div style={{fontSize:9,color:"#64748b",fontWeight:600,textAlign:"center",lineHeight:1.2,maxWidth:36,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{d.label}</div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function JoinGroupView({ inviteId, onJoined, profile }: { inviteId: string, onJoined: (group: Group) => void, profile: UserProfile | null }) {
-  const [invitation, setInvitation] = useState<Invitation | null>(null);
-  const [group, setGroup] = useState<Group | null>(null);
-  const [name, setName] = useState(profile?.name || auth.currentUser?.displayName || "");
-  const [avatar, setAvatar] = useState<string | null>(profile?.avatar || null);
-  const [loading, setLoading] = useState(true);
+// ─── Join Group Modal ──────────────────────────────────────────
+function JoinGroupModal({ group, profile, onClose, onJoined }: { group: Group, profile: UserProfile | null, onClose: () => void, onJoined: (g: Group) => void }) {
   const [joining, setJoining] = useState(false);
 
-  useEffect(() => {
-    if (profile) {
-      setName(profile.name);
-      setAvatar(profile.avatar);
-    }
-  }, [profile]);
-
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const invDoc = await getDoc(doc(db, "invitations", inviteId));
-        if (invDoc.exists()) {
-          const invData = invDoc.data() as Invitation;
-          setInvitation(invData);
-          const grpDoc = await getDoc(doc(db, "groups", invData.groupId));
-          if (grpDoc.exists()) {
-            setGroup({ ...grpDoc.data(), id: grpDoc.id } as Group);
-          }
-        }
-      } catch (err) {
-        handleFirestoreError(err, OperationType.GET, `invitations/${inviteId}`);
-      } finally {
-        setLoading(false);
-      }
-    };
-    load();
-  }, [inviteId]);
-
   const handleJoin = async () => {
-    if (!name.trim() || !group || joining) return;
+    if (!profile || joining) return;
     setJoining(true);
     try {
-      const newMembers = [...group.members, name.trim()];
-      const currentUids = group.memberUids || [];
-      const newUids = [...currentUids, auth.currentUser?.uid || ""];
-      const newDetails = { ...(group.memberDetails || {}) };
-      if (avatar || profile?.avatar) {
-        newDetails[name.trim()] = { ...(newDetails[name.trim()] || {}), avatar: avatar || profile?.avatar };
+      if (group.memberUids.includes(profile.uid)) {
+        onJoined(group);
+        return;
       }
+      
+      const newMembers = [...group.members, profile.name];
+      const newUids = [...group.memberUids, profile.uid];
+      const newDetails = { ...(group.memberDetails || {}) };
+      newDetails[profile.name] = { avatar: profile.avatar };
       
       await updateDoc(doc(db, "groups", group.id), {
         members: newMembers,
         memberUids: newUids,
-        memberDetails: newDetails
+        memberDetails: newDetails,
+        updatedAt: serverTimestamp()
       });
-
-      // Optionally delete invitation
-      await deleteDoc(doc(db, "invitations", inviteId));
 
       onJoined({ ...group, members: newMembers, memberUids: newUids, memberDetails: newDetails });
     } catch (err) {
@@ -371,58 +324,17 @@ function JoinGroupView({ inviteId, onJoined, profile }: { inviteId: string, onJo
     }
   };
 
-  useEffect(() => {
-    // If profile is already set, auto join if possible or just show confirmation
-    // For now let's just prefill and let them click "Join"
-  }, [profile]);
-
-  const handleAvatarFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (ev) => setAvatar(ev.target?.result as string);
-      reader.readAsDataURL(file);
-    }
-  };
-
-  if (loading) return <div style={{height: "100vh", display: "flex", alignItems: "center", justifyContent: "center"}}><Loader2 className="animate-spin" color="#7c3aed" /></div>;
-  if (!invitation || !group) return <div style={{padding: 40, textAlign: "center"}}>Lời mời không hợp lệ hoặc đã hết hạn.</div>;
-
   return (
-    <div style={{minHeight: "100vh", background: "linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%)", padding: "40px 20px", display: "flex", flexDirection: "column", alignItems: "center"}}>
-      <div style={{fontSize: 60, marginBottom: 20}}>{group.emoji}</div>
-      <div style={{textAlign: "center", marginBottom: 30}}>
-        <div style={{fontSize: 20, fontWeight: 800, color: "#1e1e2e"}}>Chào mừng bạn đến với {group.name}</div>
-        <div style={{fontSize: 14, color: "#64748b", marginTop: 6}}><b>{invitation.inviterName}</b> đã mời bạn tham gia nhóm này.</div>
-      </div>
-
-      <Card style={{width: "100%", maxWidth: 400, padding: 24}}>
-        <div style={{textAlign: "center", marginBottom: 20}}>
-          <div style={{position: "relative", display: "inline-block"}}>
-            {avatar ? (
-              <img src={avatar} style={{width: 90, height: 90, borderRadius: "50%", objectFit: "cover", border: "4px solid #fff", boxShadow: "0 4px 12px rgba(0,0,0,0.1)"}} />
-            ) : (
-              <Av name={name || "User"} size={90} ci={0} style={{border: "4px solid #fff", boxShadow: "0 4px 12px rgba(0,0,0,0.1)"}} />
-            )}
-            <label style={{position: "absolute", bottom: 0, right: 0, background: "#7c3aed", color: "#fff", width: 28, height: 28, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", border: "2px solid #fff"}}>
-              <Camera size={14} />
-              <input type="file" accept="image/*" onChange={handleAvatarFile} style={{display: "none"}} />
-            </label>
-          </div>
-          <div style={{fontSize: 12, color: "#94a3b8", marginTop: 8}}>Tải ảnh đại diện (tuỳ chọn)</div>
-        </div>
-
-        <div style={{marginBottom: 20}}>
-          <div style={{fontSize: 12, fontWeight: 700, color: "#1e1e2e", marginBottom: 6}}>BẠN TÊN LÀ GÌ?</div>
-          <Input placeholder="Nhập tên của bạn..." value={name} onChange={(e:any) => setName(e.target.value)} />
-        </div>
-
-        <Btn onClick={handleJoin} disabled={!name.trim() || joining} style={{width: "100%", padding: 15, fontSize: 15}}>
-          {joining ? <Loader2 className="animate-spin" /> : "Tham gia nhóm ngay 🚀"}
+    <Modal onClose={onClose}>
+      <div style={{ textAlign: "center", padding: "10px 0 20px" }}>
+        <div style={{ fontSize: 50, marginBottom: 10 }}>{group.emoji}</div>
+        <div style={{ fontSize: 20, fontWeight: 800, color: "#1e1e2e", marginBottom: 6 }}>{group.name}</div>
+        <div style={{ fontSize: 13, color: "#64748b", marginBottom: 20 }}>Mời bạn tham gia nhóm chi tiêu chung.</div>
+        <Btn onClick={handleJoin} disabled={joining} style={{ width: "100%", padding: 14 }}>
+          {joining ? "Đang xử lý..." : "Tham gia ngay 🚀"}
         </Btn>
-      </Card>
-      <div style={{marginTop: 20, fontSize: 12, color: "#94a3b8"}}>HappyShare — Quản lý chi tiêu nhóm dễ dàng</div>
-    </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -438,33 +350,10 @@ function Modal({ children, onClose }: { children: React.ReactNode, onClose: () =
   );
 }
 
-function BillDetailModal({ bill, members, onClose, onRemove }: { bill: Expense, members: string[], onClose: () => void, onRemove?: () => void }) {
+function BillDetailModal({ bill, members, onClose }: { bill: Expense, members: string[], onClose: () => void }) {
   if (!bill) return null;
-  const { splitMode, splits, amount, payers, items } = bill;
-  const getMemberShare = (m: string) => {
-    if (splitMode === "equal") return amount / members.length;
-    if (splitMode === "percent") return (splits[m] || 0) / 100 * amount;
-    if (splitMode === "adjust") { const base = amount / members.length; return base + (splits[m] || 0); }
-    if (splitMode === "itemized") {
-      let share = 0;
-      items?.forEach(it => {
-        if (it.assignedTo && it.assignedTo.length > 0) {
-          if (it.assignedTo.includes(m)) {
-            share += it.price / it.assignedTo.length;
-          }
-        } else {
-          share += it.price / members.length;
-        }
-      });
-      const allocated = items?.reduce((sum, it) => sum + (it.price || 0), 0) || 0;
-      const remaining = amount - allocated;
-      if (remaining > 0.01) {
-        share += remaining / members.length;
-      }
-      return share;
-    }
-    return 0;
-  };
+  const { splitMode, amount, payers, items, desc, ts } = bill;
+  const splits = getExpenseSplits(bill, members);
   const payerEntries = Object.entries(payers).filter(([_, amt]) => (amt || 0) > 0);
 
   return (
@@ -472,8 +361,8 @@ function BillDetailModal({ bill, members, onClose, onRemove }: { bill: Expense, 
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
         <div style={{ width: 46, height: 46, borderRadius: 13, background: "#ede9fe", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>🧾</div>
         <div>
-          <div style={{ fontWeight: 800, fontSize: 16 }}>{bill.desc}</div>
-          <div style={{ fontSize: 11, color: "#94a3b8" }}>{timeAgo(bill.ts)} · {splitMode === "equal" ? "Chia đều" : splitMode === "percent" ? "Theo %" : splitMode === "itemized" ? "Chia theo món" : "Có điều chỉnh"}</div>
+          <div style={{ fontWeight: 800, fontSize: 16 }}>{desc}</div>
+          <div style={{ fontSize: 11, color: "#94a3b8" }}>{timeAgo(ts)} · {splitMode === "equal" ? "Chia đều" : splitMode === "percent" ? "Theo %" : splitMode === "itemized" ? "Chia theo món" : "Có điều chỉnh"}</div>
         </div>
       </div>
       <div style={{ background: "linear-gradient(135deg,#7c3aed,#a78bfa)", borderRadius: 12, padding: "12px 16px", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -495,18 +384,20 @@ function BillDetailModal({ bill, members, onClose, onRemove }: { bill: Expense, 
       <div style={{ marginBottom: 14 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: "#dc2626", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Phân chia</div>
         {members.map((m, i) => {
-          const share = getMemberShare(m);
+          const share = splits[m] || 0;
           const paid = payers[m] || 0;
           const diff = paid - share;
           return (
-            <div key={i} style={{ display: "flex", alignItems: "center", gap: 9, background: diff >= 0 ? "#f0fdf4" : "#fef2f2", borderRadius: 11, padding: "9px 13px", marginBottom: 5, border: `1.5px solid ${diff >= 0 ? "#bbf7d0" : "#fecaca"}` }}>
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 9, background: diff >= 0 ? "#f0fdf4" : "#fef2f2", borderRadius: 11, padding: "9px 13px", marginBottom: 5, border: `1.5px solid ${diff >= 0 ? "#bbf7d0" : "#fecaca"}`, opacity: share > 0 || paid > 0 ? 1 : 0.4 }}>
               <Av name={m} size={32} ci={members.indexOf(m)} avatar={bill.memberDetails?.[m]?.avatar} />
               <div style={{ flex: 1 }}>
                 <div style={{ fontWeight: 600, fontSize: 13 }}>{m}</div>
-                <div style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>
-                  <span style={{ fontWeight: 900, color: diff >= 0 ? "#16a34a" : "#dc2626", background: diff >= 0 ? "#dcfce7" : "#fee2e2", padding: "1px 4px", borderRadius: 4, fontSize: 9 }}>{diff >= 0 ? "💰 ĐÃ DƯ" : "🔴 CÒN NỢ"}</span>
-                  <span style={{ color: "#64748b" }}>{fmt(Math.abs(diff))}</span>
-                </div>
+                {Math.abs(Math.round(diff)) >= 1 && (
+                  <div style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>
+                    <span style={{ fontWeight: 900, color: diff >= 0 ? "#16a34a" : "#dc2626", background: diff >= 0 ? "#dcfce7" : "#fee2e2", padding: "1px 4px", borderRadius: 4, fontSize: 9 }}>{diff >= 0 ? "💰 ĐÃ DƯ" : "🔴 CÒN NỢ"}</span>
+                    <span style={{ color: "#64748b" }}>{fmt(Math.abs(diff))}</span>
+                  </div>
+                )}
               </div>
               <span style={{ fontWeight: 800, fontSize: 13, color: diff >= 0 ? "#16a34a" : "#dc2626" }}>{fmt(share)}</span>
             </div>
@@ -540,9 +431,20 @@ function BillDetailModal({ bill, members, onClose, onRemove }: { bill: Expense, 
   );
 }
 
+const EXPENSE_CATEGORIES = [
+  { id: "food", label: "Ăn uống", icon: "🍔", color: "#f97316" },
+  { id: "transport", label: "Di chuyển", icon: "🚗", color: "#3b82f6" },
+  { id: "shopping", label: "Mua sắm", icon: "🛒", color: "#ec4899" },
+  { id: "entertainment", label: "Giải trí", icon: "🎭", color: "#8b5cf6" },
+  { id: "home", label: "Nhà cửa", icon: "🏠", color: "#10b981" },
+  { id: "health", label: "Sức khỏe", icon: "💊", color: "#ef4444" },
+  { id: "other", label: "Khác", icon: "📦", color: "#64748b" }
+];
+
 function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: string[], memberDetails?: any, onAdd: (e: Expense) => void, onClose: () => void }) {
   const [desc, setDesc] = useState("");
   const [amount, setAmount] = useState("");
+  const [category, setCategory] = useState("food");
   const [payers, setPayers] = useState<Record<string, number>>({});
   const [mode, setMode] = useState("equal");
   const [splits, setSplits] = useState<Record<string, number>>({});
@@ -550,7 +452,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
   const [items, setItems] = useState<ReceiptItem[]>([]);
   const [isScanning, setIsScanning] = useState(false);
 
-  const amt = parseFloat(amount) || 0;
+  const amt = Math.round(parseFloat(amount)) || 0;
 
   useEffect(() => {
     const keys = Object.keys(payers);
@@ -561,9 +463,10 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
     if (keys.length === 1) {
       setPayers({ [keys[0]]: amt });
     } else if (keys.length > 1) {
-      const share = amt / members.length;
+      const share = Math.floor(amt / members.length);
+      const rem = amt % members.length;
       const p: any = {};
-      members.forEach(m => p[m] = share);
+      members.forEach((m, i) => p[m] = share + (i < rem ? 1 : 0));
       setPayers(p);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -572,7 +475,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
   const payerVals = Object.values(payers) as number[];
   const totalPaid = payerVals.reduce((s: number, v: number) => s + (v || 0), 0);
 
-  const updateSplit = (m: string, val: string) => setSplits(s => ({ ...s, [m]: parseFloat(val) || 0 }));
+  const updateSplit = (m: string, val: string) => setSplits(s => ({ ...s, [m]: Math.round(parseFloat(val)) || 0 }));
 
   const totalPct = members.reduce((s: number, m: string) => s + (splits[m] || 0), 0);
   const totalAdj = members.reduce((s: number, m: string) => s + (splits[m] || 0), 0);
@@ -580,13 +483,22 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
   const valid = desc.trim() && amt > 0 && Math.abs(totalPaid - amt) < 1 && (
     mode === "equal" ||
     (mode === "percent" && Math.abs(totalPct - 100) < 0.01) ||
-    (mode === "adjust" && Math.abs(totalAdj) < 0.01) ||
+    (mode === "adjust" && Math.abs(totalAdj) < 1) ||
     mode === "itemized"
   );
 
   const handleAdd = () => {
     if (!valid) return;
-    const expData: any = { id: String(Date.now()), desc: desc.trim(), amount: amt, payers: { ...payers }, splitMode: mode, splits: { ...splits }, ts: Date.now() };
+    const expData: any = { 
+      id: String(Date.now()), 
+      desc: desc.trim(), 
+      amount: amt, 
+      category,
+      payers: { ...payers }, 
+      splitMode: mode, 
+      splits: { ...splits }, 
+      ts: Date.now() 
+    };
     if (mode === "itemized") expData.items = items;
     onAdd(expData);
     onClose();
@@ -655,7 +567,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
         </div>
         <div style={{ display: "flex", gap: 5 }}>
           <label style={{ display: "flex", alignItems: "center", gap: 6, background: "linear-gradient(135deg,#ec4899,#f43f5e)", color: "#fff", padding: "6px 10px", borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: "pointer", boxShadow: "0 2px 5px rgba(236,72,153,0.3)" }}>
-             {isScanning ? <Loader2 size={14} className="animate-spin"/> : <Camera size={14}/>}
+           {isScanning ? <Loader2 size={18} className="animate-spin"/> : <Camera size={18}/>}
              {isScanning ? "Đang quét..." : "Chụp AI"}
              <input type="file" accept="image/*" capture="environment" onChange={(e) => { if(e.target.files?.[0]) scanReceipt(e.target.files[0]); }} style={{ display: "none" }} />
           </label>
@@ -669,7 +581,26 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
 
       <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
         <Input placeholder="Mô tả" value={desc} onChange={(e: any) => setDesc(e.target.value)} />
-        <Input placeholder="Số tiền" type="number" min="0" value={amount} onChange={(e: any) => setAmount(e.target.value)} />
+        <Input placeholder="Số tiền" type="text" inputMode="numeric" value={formatNum(amount)} onChange={(e: any) => setAmount(parseNumStr(e.target.value))} />
+
+        <div style={{ marginBottom: 4 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>Phân loại</div>
+          <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 6, scrollbarWidth: "none" }}>
+            {EXPENSE_CATEGORIES.map(cat => (
+              <div 
+                key={cat.id} 
+                onClick={() => setCategory(cat.id)}
+                style={{
+                  display: "flex", flexDirection: "column", alignItems: "center", gap: 4, padding: "8px 12px", borderRadius: 12, cursor: "pointer", flexShrink: 0,
+                  transition: "all 0.2s", background: category === cat.id ? `${cat.color}15` : "#f8fafc", border: category === cat.id ? `2px solid ${cat.color}` : "2px solid #f1f5f9"
+                }}
+              >
+                <span style={{ fontSize: 18 }}>{cat.icon}</span>
+                <span style={{ fontSize: 10, fontWeight: 700, color: category === cat.id ? cat.color : "#64748b" }}>{cat.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
 
         <div>
           <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6, display: "flex", justifyContent: "space-between" }}>
@@ -774,11 +705,21 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
             )}
             {mode === "adjust" && (
               <>
-                <div style={{ fontSize: 11, color: Math.abs(totalAdj) < 0.01 ? "#059669" : "#dc2626", fontWeight: 700, marginBottom: 8 }}>Bù: {fmt(totalAdj)}</div>
+                <div style={{ fontSize: 11, color: Math.abs(totalAdj) < 1 ? "#059669" : "#dc2626", fontWeight: 700, marginBottom: 8 }}>Bù: {fmt(totalAdj)}</div>
                 {members.map((m, i) => (
                   <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
                     <Av name={m} size={26} ci={i} avatar={memberDetails?.[m]?.avatar}/><span style={{ flex: 1, fontSize: 12, fontWeight: 600 }}>{m}</span>
-                    <input type="number" value={splits[m] || ""} onChange={e => updateSplit(m, e.target.value)} placeholder="0" style={{ width: 80, border: "2px solid #e2e8f0", borderRadius: 8, padding: "5px 7px", fontSize: 13, outline: "none", textAlign: "right" }} />
+                    <input 
+                      type="text" 
+                      inputMode="numeric"
+                      value={formatNum(splits[m] || "")} 
+                      onChange={e => {
+                        const val = parseNum(e.target.value);
+                        setSplits(s => ({ ...s, [m]: val }));
+                      }} 
+                      placeholder="0" 
+                      style={{ width: 80, border: "2px solid #e2e8f0", borderRadius: 8, padding: "5px 7px", fontSize: 13, outline: "none", textAlign: "right" }} 
+                    />
                   </div>
                 ))}
               </>
@@ -797,8 +738,8 @@ function PayModal({ members, memberDetails, transactions, onPay, onClose }: { me
   const [amount,setAmount]=useState(transactions[0]?Math.round(transactions[0].amount):"");
   const [note,setNote]=useState("");
   const suggested = transactions.find(t=>t.from===from&&t.to===to);
-  const handlePay = () => {
-    const amt=parseFloat(amount as string);
+  const handlePay = (overrideAmt?: number) => {
+    const amt = overrideAmt !== undefined ? overrideAmt : Math.round(parseFloat(amount as string));
     if(!from||!to||from===to||isNaN(amt)||amt<=0) return;
     onPay({id: String(Date.now()), from,to,amount:amt,note:note.trim(),ts:Date.now()});
     onClose();
@@ -829,78 +770,72 @@ function PayModal({ members, memberDetails, transactions, onPay, onClose }: { me
           ))}
         </div>
       </div>
-      {suggested&&<div style={{background:"#fff7ed",borderRadius:9,padding:"7px 11px",marginBottom:10,fontSize:12,color:"#d97706",display:"flex",alignItems:"center",gap:6}}>💡 <span><b>{from}</b> cần trả <b>{fmt(suggested.amount)}</b></span><button onClick={()=>setAmount(Math.round(suggested.amount).toString())} style={{marginLeft:"auto",background:"#d97706",color:"#fff",border:"none",borderRadius:6,padding:"3px 8px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Dùng</button></div>}
-      <Input placeholder="Số tiền" type="number" value={amount} onChange={(e: any)=>setAmount(e.target.value)} style={{marginBottom:8}}/>
+      {suggested&&<div style={{background:"#fff7ed",borderRadius:9,padding:"7px 11px",marginBottom:10,fontSize:12,color:"#d97706",display:"flex",alignItems:"center",gap:6}}>💡 <span><b>{from}</b> cần trả <b>{fmt(suggested.amount)}</b></span><button onClick={()=>handlePay(Math.round(suggested.amount))} style={{marginLeft:"auto",background:"#d97706",color:"#fff",border:"none",borderRadius:6,padding:"3px 8px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Dùng</button></div>}
+      <Input 
+        placeholder="Số tiền" 
+        type="text" 
+        inputMode="numeric"
+        value={formatNum(amount)} 
+        onChange={(e: any)=>setAmount(parseNumStr(e.target.value))} 
+        style={{marginBottom:8}}
+      />
       <Input placeholder="Ghi chú (tuỳ chọn)" value={note} onChange={(e: any)=>setNote(e.target.value)} style={{marginBottom:12}}/>
-      <Btn onClick={handlePay} color="linear-gradient(135deg,#059669,#34d399)" style={{width:"100%"}}>✅ Xác nhận thanh toán</Btn>
+      <Btn onClick={() => handlePay()} color="linear-gradient(135deg,#059669,#34d399)" style={{width:"100%"}}>✅ Xác nhận thanh toán</Btn>
     </Modal>
   );
 }
 
 function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, onLeave, onDelete }: { group: Group, friends: Friend[], currentUser: string, onClose: () => void, onUpdate: (g: Group) => void, onLeave: () => void, onDelete: () => void }) {
-  const [newInviteEmail, setNewInviteEmail] = useState("");
-  const [invitations, setInvitations] = useState<Invitation[]>([]);
+  const [newMemberName, setNewMemberName] = useState("");
   const isLeader = group.leaderUid ? group.leaderUid === auth.currentUser?.uid : group.leader === currentUser;
-  const inviteCode = group.inviteCode;
   const [copiedCode, setCopiedCode] = useState(false);
 
-  useEffect(() => {
-    const unsub = onSnapshot(query(collection(db, "invitations"), where("groupId", "==", group.id)), (snap) => {
-      setInvitations(snap.docs.map(d => ({ ...d.data(), id: d.id } as Invitation)));
-    }, err => handleFirestoreError(err, OperationType.LIST, "invitations"));
-    return unsub;
-  }, [group.id]);
+  const copyCode = () => {
+    navigator.clipboard.writeText(`${window.location.origin}/?joinCode=${group.inviteCode}`);
+    setCopiedCode(true);
+    setTimeout(() => setCopiedCode(false), 2000);
+  };
 
-  const copyCode = () => { navigator.clipboard.writeText(inviteCode); setCopiedCode(true); setTimeout(() => setCopiedCode(false), 2000); };
-  
-  const sendInvite = async () => {
-    const email = newInviteEmail.trim();
-    if (!email || !email.includes("@")) return;
-    if (email === auth.currentUser?.email) {
-      alert("Bạn không thể mời chính mình!");
+  const addMember = () => {
+    const input = newMemberName.trim();
+    if (!input) return;
+
+    if (group.members.includes(input)) {
+      alert("Thành viên này đã có trong nhóm!");
       return;
     }
-    try {
-      const invDoc = await addDoc(collection(db, "invitations"), {
-        groupId: group.id,
-        inviterName: auth.currentUser?.displayName || "Trưởng nhóm",
-        email,
-        ts: Date.now()
-      });
-      sendEmailInvite(email, auth.currentUser?.displayName || "Bạn", group.name, invDoc.id);
-      setNewInviteEmail("");
-    } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, "invitations");
+    const dummyUid = "m_" + Date.now();
+    const newM = [...group.members, input];
+    const newUids = [...group.memberUids, dummyUid];
+    const newDetails = { ...(group.memberDetails || {}), [input]: { avatar: "" } };
+    onUpdate({ ...group, members: newM, memberUids: newUids, memberDetails: newDetails });
+    setNewMemberName("");
+  };
+
+  const addFriend = (f: Friend) => {
+    if (group.members.includes(f.name)) {
+      alert("Bạn này đã có trong nhóm rồi!");
+      return;
     }
-  };
-
-  const removeInvite = async (id: string) => {
-    try {
-      await deleteDoc(doc(db, "invitations", id));
-    } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, `invitations/${id}`);
-    }
-  };
-
-  const getInviteLink = (id: string) => {
-    return `${window.location.origin}/?inviteId=${id}`;
-  };
-
-  const copyLink = (id: string) => {
-    navigator.clipboard.writeText(getInviteLink(id));
-    alert("Đã sao chép link mời!");
+    const dummyUid = "m_" + Date.now();
+    const newM = [...group.members, f.name];
+    const newUids = [...group.memberUids, dummyUid];
+    const newDetails = { ...(group.memberDetails || {}), [f.name]: { avatar: f.avatar || "" } };
+    onUpdate({ ...group, members: newM, memberUids: newUids, memberDetails: newDetails });
   };
 
   return (
     <Modal onClose={onClose}>
       <div style={{fontWeight:800,fontSize:16,marginBottom:16,color:"#1e1e2e"}}>⚙️ Cài đặt nhóm</div>
+      
       <Card style={{background:"#f5f3ff",marginBottom:10}}>
-        <SecTitle icon="🔗" title="Mã mời" color="#7c3aed"/>
+        <SecTitle icon="🔗" title="Link mời bạn bè" color="#7c3aed"/>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
-          <div style={{flex:1,background:"#ede9fe",borderRadius:9,padding:"10px 14px",fontWeight:800,fontSize:18,color:"#7c3aed",letterSpacing:3,textAlign:"center"}}>{inviteCode}</div>
-          <button onClick={copyCode} style={{background:copiedCode?"#059669":"#7c3aed",color:"#fff",border:"none",borderRadius:9,padding:"10px 14px",fontWeight:700,fontSize:12,cursor:"pointer"}}>{copiedCode?"✅ Đã sao chép":"📋 Sao chép"}</button>
+          <div style={{flex:1,background:"#ede9fe",borderRadius:9,padding:"10px 14px",fontWeight:800,fontSize:14,color:"#7c3aed",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{`${window.location.origin}/?joinCode=${group.inviteCode}`}</div>
+          <button onClick={copyCode} style={{background:copiedCode?"#059669":"#7c3aed",color:"#fff",border:"none",borderRadius:9,padding:"10px 14px",fontWeight:700,fontSize:12,cursor:"pointer"}}>{copiedCode?"✅ Đã copy":"📋 Copy"}</button>
         </div>
       </Card>
+
       <Card style={{marginBottom:10}}>
         <SecTitle icon="👥" title="Thành viên nhóm" color="#2563eb"/>
         <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
@@ -923,35 +858,21 @@ function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, on
         
         <div style={{ height: 1, background: "#f1f5f9", margin: "14px 0" }} />
         
-        <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>LỜI MỜI ĐANG CHỜ ({invitations.length})</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
-          {invitations.map((inv) => (
-            <div key={inv.id} style={{ display: "flex", alignItems: "center", gap: 8, background: "#fdf2f8", padding: "8px 10px", borderRadius: 10, border: "1px solid #fecaca" }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13, fontWeight: 700, color: "#be185d" }}>{inv.email}</div>
-                <div style={{ fontSize: 10, color: "#fb7185" }}>Chờ chấp nhận · {timeAgo(inv.ts)}</div>
-              </div>
-              <button onClick={() => copyLink(inv.id)} style={{ background: "#be185d", color: "#fff", border: "none", padding: "4px 8px", borderRadius: 6, fontSize: 10, fontWeight: 700, cursor: "pointer" }}>Link</button>
-              {isLeader && <button onClick={() => removeInvite(inv.id)} style={{ background: "none", border: "none", color: "#dc2626", fontSize: 16, cursor: "pointer" }}>×</button>}
+        <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>THÊM TỪ BẠN BÈ</div>
+        <div style={{ display: "flex", gap: 8, overflowX: "auto", background: "#f8fafc", padding: "10px", borderRadius: 12, border: "1px solid #e2e8f0", marginBottom: 15, scrollbarWidth: "none" }}>
+          {friends.filter(f => !group.members.includes(f.name)).map((f, i) => (
+            <div key={i} onClick={() => addFriend(f)} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 5, flexShrink: 0, cursor: "pointer" }}>
+              <Av name={f.name} size={40} avatar={f.avatar} />
+              <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", width: 45, textAlign: "center", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name.split(" ")[0]}</div>
             </div>
           ))}
-          {invitations.length === 0 && <div style={{ fontSize: 11, color: "#94a3b8", textAlign: "center" }}>Không có lời mời nào đang chờ.</div>}
+          {friends.length === 0 && <div style={{ fontSize: 11, color: "#94a3b8", textAlign: "center", width: "100%" }}>Chưa có bạn bè để thêm.</div>}
         </div>
 
-        <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>MỜI NHANH TỪ BẠN BÈ</div>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", maxHeight: 80, overflowY: "auto", background: "#f8fafc", padding: 8, borderRadius: 8, border: "1px solid #e2e8f0", marginBottom: 15 }}>
-          {friends.filter(f => f.email && !group.members.includes(f.name) && !invitations.some(inv => inv.email === f.email)).map((f, i) => (
-            <button key={i} onClick={() => { setNewInviteEmail(f.email || ""); }} style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 8px", borderRadius: 12, border: "1px solid #7c3aed", background: "#fff", cursor: "pointer", fontSize: 11, fontWeight: 600, color: "#7c3aed" }}>
-              {f.name} ({f.email})
-            </button>
-          ))}
-          {friends.filter(f => f.email && !group.members.includes(f.name)).length === 0 && <div style={{ fontSize: 10, color: "#94a3b8" }}>Không có bạn bè nào có email để mời nhanh.</div>}
-        </div>
-
-        <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>MỜI THÀNH VIÊN MỚI QUA EMAIL</div>
+        <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>THÊM THÀNH VIÊN (Nhập tên)</div>
         <div style={{ display: "flex", gap: 8 }}>
-          <Input placeholder="Nhập email..." value={newInviteEmail} onChange={(e: any) => setNewInviteEmail(e.target.value)} style={{ fontSize: 13, flex: 1 }} />
-          <Btn onClick={sendInvite} style={{ fontSize: 13 }}>Gửi</Btn>
+          <Input placeholder="Nhập tên thành viên..." value={newMemberName} onChange={(e: any) => setNewMemberName(e.target.value)} style={{ fontSize: 13, flex: 1 }} />
+          <Btn onClick={addMember} style={{ fontSize: 13 }}>Thêm</Btn>
         </div>
       </Card>
       <div style={{display:"flex",flexDirection:"column",gap:8}}>
@@ -963,64 +884,189 @@ function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, on
 }
 
 function GroupStats({ group, expenses, payments, balances }: { group: Group, expenses: Expense[], payments: Payment[], balances: Record<string, number>, transactions: any[] }) {
-  const [chartView,setChartView]=useState("spend"); // spend | debt | compare
+  const [chartView,setChartView]=useState("spend"); // spend | debt | cat | trend
   const members=group.members;
 
-  const spendData = members.map((m, i) => ({
-    label: m,
-    value: expenses.reduce((s: number, e: Expense) => s + (e.payers[m] || 0), 0),
-    color: COLORS[i % COLORS.length]
-  })).filter(d => d.value > 0);
-  const debtData = members.map((m,i)=>({label:m,value:Math.abs(balances[m]||0),color:balances[m]>0?"#059669":"#dc2626"})).filter(d=>d.value>0);
+  // ─── Trend Data ───
+  const trendData = useMemo(() => {
+    const daily: Record<string, number> = {};
+    const sorted = [...expenses].sort((a,b) => a.ts - b.ts);
+    sorted.forEach(e => {
+      const d = new Date(e.ts).toLocaleDateString("vi-VN", { day: "numeric", month: "numeric" });
+      daily[d] = (daily[d] || 0) + e.amount;
+    });
+    return Object.entries(daily).map(([name, amount]) => ({ name, amount }));
+  }, [expenses]);
 
-  const totalSpend = expenses.reduce((s,e)=>s+e.amount,0);
+  // ─── Category Data ───
+  const categoryData = useMemo(() => {
+    const cats: Record<string, number> = {};
+    expenses.forEach(e => {
+      const c = e.category || "other";
+      cats[c] = (cats[c] || 0) + e.amount;
+    });
+    return EXPENSE_CATEGORIES.map(c => ({
+      name: c.label,
+      value: cats[c.id] || 0,
+      color: c.color,
+      icon: c.icon
+    })).filter(d => d.value > 0).sort((a,b) => b.value - a.value);
+  }, [expenses]);
+
+  const memberStats = useMemo(() => {
+    // We pre-calculate all splits for all expenses
+    const expenseSplits = expenses.map(e => getExpenseSplits(e, members));
+    
+    return members.map((m, i) => {
+      const share = expenses.reduce((s, e, idx) => s + (expenseSplits[idx][m] || 0), 0);
+      const actuallyPaid = expenses.reduce((s, e) => s + Math.round(e.payers[m] || 0), 0);
+      const settlementsSent = payments.filter(p => p.from === m).reduce((s, p) => s + Math.round(p.amount), 0);
+      const settlementsReceived = payments.filter(p => p.to === m).reduce((s, p) => s + Math.round(p.amount), 0);
+      
+      const contribution = actuallyPaid + settlementsSent - settlementsReceived;
+      const balance = contribution - share;
+      
+      const isDebt = Math.round(balance) <= -1;
+      const paidPortion = isDebt ? contribution : share;
+      const remainingPortion = isDebt ? (share - contribution) : 0;
+      const extraPortion = isDebt ? 0 : (contribution - share);
+
+      return {
+        name: m,
+        paid: actuallyPaid, 
+        contribution, 
+        share,
+        balance,
+        paidPortion,
+        remainingPortion,
+        extraPortion,
+        color: COLORS[i % COLORS.length]
+      };
+    });
+  }, [expenses, members, payments]);
+
+  const totalSpend = useMemo(() => expenses.reduce((s, e) => s + Math.round(e.amount), 0), [expenses]);
+
+  const CustomTooltip = ({ active, payload }: any) => {
+    if (active && payload && payload.length) {
+      const data = payload[0].payload;
+      return (
+        <div style={{ background: "white", padding: "8px 12px", border: "1px solid #e2e8f0", borderRadius: 8, boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1)" }}>
+          <p style={{ fontWeight: 700, margin: 0, fontSize: 12, color: "#1e293b" }}>{data.name}</p>
+          {chartView === "spend" ? (
+            <p style={{ margin: 0, fontSize: 12, fontWeight: 800, color: data.color }}>{fmt(data.paid)}</p>
+          ) : (
+            <>
+              <p style={{ margin: 0, fontSize: 11, color: "#64748b" }}>Đã góp: <span style={{ fontWeight: 700, color: "#059669" }}>{fmt(data.contribution)}</span></p>
+              <p style={{ margin: 0, fontSize: 11, color: "#64748b" }}>Phần chi: <span style={{ fontWeight: 700, color: "#1e293b" }}>{fmt(data.share)}</span></p>
+              <p style={{ margin: 0, fontSize: 11, fontWeight: 700, color: Math.round(data.balance) >= 1 ? "#059669" : Math.round(data.balance) <= -1 ? "#dc2626" : "#64748b" }}>
+                {Math.abs(Math.round(data.balance)) >= 1 ? (data.balance > 0 ? "Dư: +" : "Nợ: ") : "Đã xong"}
+                {Math.abs(Math.round(data.balance)) >= 1 ? fmt(data.balance) : ""}
+              </p>
+            </>
+          )}
+        </div>
+      );
+    }
+    return null;
+  };
 
   return (
     <Card>
       <SecTitle icon="📊" title="Thống kê" color="#2563eb"/>
-      <div style={{display:"flex",background:"#f1f5f9",borderRadius:10,padding:3,gap:2,marginBottom:14}}>
-        {[["spend","💰 Chi tiền"],["debt","⚖️ Số nợ"]].map(([v,l])=>(
-          <button key={v} onClick={()=>setChartView(v)} style={{flex:1,padding:"7px 4px",border:"none",borderRadius:8,background:chartView===v?"#7c3aed":"transparent",color:chartView===v?"#fff":"#64748b",fontWeight:700,fontSize:11,cursor:"pointer"}}>{l}</button>
+      <div style={{display:"flex",background:"#f1f5f9",borderRadius:10,padding:3,gap:2,marginBottom:20}}>
+        {[["spend","💰 Tiền chi"],["debt","⚖️ Nợ"],["cat","📂 Loại"],["trend","📈 Xu hướng"]].map(([v,l])=>(
+          <button key={v} onClick={()=>setChartView(v)} style={{flex:1,padding:"8px 1px",border:"none",borderRadius:8,background:chartView===v?"#7c3aed":"transparent",color:chartView===v?"#fff":"#64748b",fontWeight:700,fontSize:10,transition:"all 0.2s",cursor:"pointer"}}>{l}</button>
         ))}
       </div>
 
-      {chartView==="spend" && (
-        <>
-          <div style={{display:"flex",alignItems:"center",gap:16,marginBottom:12}}>
-            <PieChart data={spendData} size={110}/>
-            <div style={{flex:1}}>
-              {spendData.map((d,i)=>(
-                <div key={i} style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
-                  <div style={{width:10,height:10,borderRadius:"50%",background:d.color,flexShrink:0}}/>
-                  <span style={{fontSize:12,fontWeight:600,flex:1,color:"#374151"}}>{d.label}</span>
-                  <span style={{fontSize:11,fontWeight:700,color:d.color}}>{fmtShort(d.value)}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div style={{textAlign:"center",fontSize:12,color:"#94a3b8",marginTop:8}}>Tổng: <b style={{color:"#7c3aed"}}>{fmt(totalSpend)}</b></div>
-        </>
-      )}
+      <div style={{ height: members.length * 50 + 100, minHeight: 250 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          {chartView === "spend" ? (
+            <BarChart data={memberStats} layout="vertical" margin={{ top: 5, right: 15, left: -20, bottom: 5 }}>
+              <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f1f5f9" />
+              <XAxis type="number" fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v)} />
+              <YAxis dataKey="name" type="category" fontSize={11} fontWeight={600} stroke="#475569" width={75} />
+              <Tooltip content={<CustomTooltip />} cursor={{ fill: "#f8fafc" }} />
+              <Bar dataKey="paid" radius={[0, 4, 4, 0]} barSize={24}>
+                {memberStats.map((entry, index) => (
+                  <Cell key={`cell-${index}`} fill={entry.color} />
+                ))}
+              </Bar>
+            </BarChart>
+          ) : chartView === "debt" ? (
+            <BarChart data={memberStats} layout="vertical" margin={{ top: 5, right: 15, left: -20, bottom: 5 }}>
+              <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f1f5f9" />
+              <XAxis type="number" fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v)} />
+              <YAxis dataKey="name" type="category" fontSize={11} fontWeight={600} stroke="#475569" width={75} />
+              <Tooltip content={<CustomTooltip />} cursor={{ fill: "#f8fafc" }} />
+              <Bar dataKey="paidPortion" stackId="a" fill="#059669" radius={[0, 0, 0, 0]} barSize={24} name="Đã trả" opacity={0.8} />
+              <Bar dataKey="remainingPortion" stackId="a" fill="#dc2626" radius={[0, 4, 4, 0]} name="Còn nợ" />
+              <Bar dataKey="extraPortion" stackId="a" fill="#3b82f6" radius={[0, 4, 4, 0]} name="Trả dư" />
+              <ReferenceLine x={0} stroke="#64748b" />
+            </BarChart>
+          ) : chartView === "cat" ? (
+            <BarChart data={categoryData} layout="vertical" margin={{ top: 5, right: 15, left: -20, bottom: 5 }}>
+              <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f1f5f9" />
+              <XAxis type="number" fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v)} />
+              <YAxis dataKey="name" type="category" fontSize={11} fontWeight={600} stroke="#475569" width={75} />
+              <Tooltip formatter={(v:any)=>fmt(v)} cursor={{ fill: "#f8fafc" }} />
+              <Bar dataKey="value" radius={[0, 4, 4, 0]} barSize={24}>
+                {categoryData.map((entry, index) => (
+                  <Cell key={`cell-${index}`} fill={entry.color} />
+                ))}
+              </Bar>
+            </BarChart>
+          ) : (
+            <AreaChart data={trendData} margin={{ top: 10, right: 10, left: 10, bottom: 20 }}>
+              <defs>
+                <linearGradient id="colorAmt" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#7c3aed" stopOpacity={0.3}/>
+                  <stop offset="95%" stopColor="#7c3aed" stopOpacity={0}/>
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+              <XAxis dataKey="name" fontSize={10} stroke="#94a3b8" dy={10} />
+              <YAxis fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v)} width={40} />
+              <Tooltip formatter={(v:any)=>fmt(v)} />
+              <Area type="monotone" dataKey="amount" stroke="#7c3aed" strokeWidth={3} fillOpacity={1} fill="url(#colorAmt)" />
+            </AreaChart>
+          )}
+        </ResponsiveContainer>
+      </div>
 
-      {chartView==="debt" && (
-        <>
-          <div style={{display:"flex",alignItems:"center",gap:16,marginBottom:12}}>
-            <PieChart data={debtData} size={110}/>
-            <div style={{flex:1}}>
-              {members.map((m,i)=>{
-                const b=balances[m]||0;
-                return (
-                  <div key={i} style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
-                    <Av name={m} size={20} ci={i} avatar={group.memberDetails?.[m]?.avatar}/>
-                    <span style={{fontSize:12,fontWeight:600,flex:1}}>{m}</span>
-                    <span style={{fontSize:11,fontWeight:700,color:b>0.01?"#059669":b<-0.01?"#dc2626":"#94a3b8"}}>{b>0.01?"+":""}{fmtShort(b)}</span>
-                  </div>
-                );
-              })}
+      <div style={{ marginTop: 16, display: "flex", flexWrap: "wrap", gap: 12, justifyContent: "center" }}>
+        {chartView === "spend" ? (
+          <div style={{fontSize:12,color:"#64748b"}}>Tổng chi tiêu nhóm: <b style={{color:"#7c3aed"}}>{fmt(totalSpend)}</b></div>
+        ) : chartView === "debt" ? (
+          <div style={{display:"flex",gap:12}}>
+            <div style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:"#64748b"}}>
+              <div style={{width:8,height:8,background:"#059669",borderRadius:2}}/> Đã trả
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:"#64748b"}}>
+              <div style={{width:8,height:8,background:"#dc2626",borderRadius:2}}/> Còn nợ
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:"#64748b"}}>
+              <div style={{width:8,height:8,background:"#3b82f6",borderRadius:2}}/> Trả dư
             </div>
           </div>
-        </>
-      )}
+        ) : chartView === "cat" ? (
+           <div style={{fontSize:11,color:"#64748b"}}>Danh mục chi tiêu nhiều nhất: <b style={{color:"#1e293b"}}>{categoryData[0]?.name || "N/A"} ({fmt(categoryData[0]?.value || 0)})</b></div>
+        ) : (
+           <div style={{fontSize:11,color:"#64748b"}}>Tần suất chi tiêu: <b style={{color:"#1e293b"}}>{expenses.length} khoản chi</b></div>
+        )}
+      </div>
+
+      <div style={{marginTop: 20, paddingTop: 16, borderTop: "1px dashed #e2e8f0", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10}}>
+        <div style={{background: "#f8fafc", padding: 10, borderRadius: 12}}>
+          <div style={{fontSize: 10, color: "#64748b", fontWeight: 700, textTransform: "uppercase", marginBottom: 4}}>Khoản chi lớn nhất</div>
+          <div style={{fontSize: 14, fontWeight: 800, color: "#1e293b"}}>{fmt(Math.max(...expenses.map(e => e.amount), 0))}</div>
+        </div>
+        <div style={{background: "#f8fafc", padding: 10, borderRadius: 12}}>
+          <div style={{fontSize: 10, color: "#64748b", fontWeight: 700, textTransform: "uppercase", marginBottom: 4}}>TB mỗi khoản chi</div>
+          <div style={{fontSize: 14, fontWeight: 800, color: "#1e293b"}}>{fmt(expenses.length ? totalSpend / expenses.length : 0)}</div>
+        </div>
+      </div>
     </Card>
   );
 }
@@ -1209,7 +1255,14 @@ function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddEx
   }, []);
 
   if (groups.length === 0) {
-    return <div style={{padding: 40, textAlign: "center", color: "#64748b"}}>Bạn cần tham gia ít nhất 1 nhóm để quét hóa đơn.</div>;
+    return (
+      <div style={{padding: "20px 14px", paddingBottom: 100, maxWidth: 500, margin: "0 auto", textAlign: "center"}}>
+        <SecTitle icon="📷" title="Quét Hóa Đơn AI" color="#fff" textColor="#fff" />
+        <div style={{padding: 40, color: "#fff", fontSize: 16, fontWeight: 500, background: "rgba(255,255,255,0.1)", borderRadius: 16, marginTop: 20}}>
+          Bạn cần tham gia ít nhất 1 nhóm để quét hóa đơn.
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -1227,12 +1280,12 @@ function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddEx
           {groupId && !isCameraLive && (
              <div style={{display: "flex", flexDirection: "column", gap: 10}}>
                 <button onClick={startCamera} style={{display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: 15, background: "linear-gradient(135deg,#ec4899,#f43f5e)", border: "none", color: "#fff", borderRadius: 12, cursor: "pointer", fontWeight: 700}}>
-                   <Camera size={20} />
-                   Quét trực tiếp (Camera)
+                   <Camera size={28} />
+                   <span style={{ fontSize: 14 }}>Máy ảnh (Chụp AI)</span>
                 </button>
                 <label style={{display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: 15, background: "#f8fafc", color: "#64748b", border: "2px dashed #cbd5e1", borderRadius: 12, cursor: "pointer", fontWeight: 700}}>
-                   <Upload size={20} />
-                   Tải ảnh lên
+                   <Upload size={28} />
+                   <span style={{ fontSize: 14 }}>Tải ảnh lên</span>
                    <input type="file" accept="image/*" onChange={handleImage} style={{display: "none"}} />
                 </label>
              </div>
@@ -1332,7 +1385,7 @@ function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddEx
   );
 }
 
-function GroupView({ group, friends, onUpdate, onDelete, onLeave, onBack }: { group: Group, friends: Friend[], onUpdate: (g: Group) => void, onDelete: () => void, onLeave: () => void, onBack: () => void }) {
+function GroupView({ group, friends, currentUserName, onUpdate, onDelete, onLeave, onBack }: { group: Group, friends: Friend[], currentUserName: string, onUpdate: (g: Group) => void, onDelete: () => void, onLeave: () => void, onBack: () => void }) {
   const [subTab,setSubTab]=useState("home");
   const [selectedBill,setSelectedBill]=useState<Expense | null>(null);
   const [showAddExp,setShowAddExp]=useState(false);
@@ -1380,16 +1433,7 @@ function GroupView({ group, friends, onUpdate, onDelete, onLeave, onBack }: { gr
     }
   };
 
-  const removeExpense = async (id: string) => {
-    try {
-      await deleteDoc(doc(db, "groups", group.id, "expenses", id));
-      alert("✅ Đã xóa hóa đơn!");
-      return true;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, `groups/${group.id}/expenses/${id}`);
-      return false;
-    }
-  };
+
 
   const addPayment = async (p: any) => {
     try {
@@ -1408,6 +1452,25 @@ function GroupView({ group, friends, onUpdate, onDelete, onLeave, onBack }: { gr
   };
 
   const { total, balances, transactions } = useMemo(() => computeGroupBalances({ ...group, expenses, payments }), [group, expenses, payments]);
+
+  const resolveMemberDisplay = (name: string) => {
+    const idx = members.indexOf(name);
+    const uid = group.memberUids?.[idx];
+    const isMe = uid === auth.currentUser?.uid;
+    const isLeader = uid === group.leaderUid || name === group.leader;
+    
+    let finalName = name;
+    // Fallback for generic names
+    if (name === "Bạn" || name === "Thành viên" || name === "Trưởng nhóm") {
+      if (isMe && currentUserName && currentUserName !== name) {
+        finalName = currentUserName;
+      } else if (isLeader && group.leader && group.leader !== name) {
+        finalName = group.leader;
+      }
+    }
+    
+    return { name: finalName || "Thành viên", isMe, isLeader };
+  };
 
   const subtabs=[{id:"home",icon:"🏠"},{id:"expenses",icon:"🧾"},{id:"stats",icon:"📊"},{id:"members",icon:"👥"},{id:"feed",icon:"🔔"}];
 
@@ -1430,7 +1493,7 @@ function GroupView({ group, friends, onUpdate, onDelete, onLeave, onBack }: { gr
           <div style={{fontSize:32}}>{group.emoji}</div>
           <div style={{flex:1}}>
             <div style={{color:"#fff",fontWeight:800,fontSize:17}}>{group.name}</div>
-            <div style={{color:"#ddd6fe",fontSize:11}}>{members.length} thành viên · {fmt(total)}</div>
+            <div style={{color:"#ddd6fe",fontSize:11}}>{members.length} thành viên · {total > 0 ? fmt(total) : "Chưa chi"}</div>
           </div>
           <button onClick={()=>setShowSettings(true)} style={{background:"rgba(255,255,255,.2)",border:"none",borderRadius:9,width:34,height:34,color:"#fff",fontSize:16,cursor:"pointer"}}>⚙️</button>
         </div>
@@ -1448,37 +1511,82 @@ function GroupView({ group, friends, onUpdate, onDelete, onLeave, onBack }: { gr
               <button onClick={()=>setShowAddExp(true)} style={{flex:1,background:"linear-gradient(135deg,#2563eb,#60a5fa)",color:"#fff",border:"none",borderRadius:12,padding:"11px",fontWeight:700,fontSize:13,cursor:"pointer"}}>🧾 Thêm khoản chi</button>
               <button onClick={()=>setShowPay(true)} style={{flex:1,background:"linear-gradient(135deg,#059669,#34d399)",color:"#fff",border:"none",borderRadius:12,padding:"11px",fontWeight:700,fontSize:13,cursor:"pointer"}}>💸 Thanh toán</button>
             </div>
-            <Card style={{padding:"14px"}}>
+            <Card style={{padding:"14px 8px"}}>
               <SecTitle icon="🔄" title="Ai đang nợ ai?" color="#d97706"/>
               {transactions.length===0?(
                 <div style={{textAlign:"center",padding:"12px 0",color:"#94a3b8",fontSize:13}}>{expenses.length===0?"Chưa có hóa đơn nào":"🎉 Mọi người đã huề!"}</div>
-              ):transactions.map((t,i)=>(
-                <div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"9px 0",borderBottom:i<transactions.length-1?"1px solid #f3f4f6":"none"}}>
-                  <Av name={t.from} size={32} ci={members.indexOf(t.from)} avatar={group.memberDetails?.[t.from]?.avatar}/>
-                  <div style={{flex:1,fontSize:13,fontWeight:700}}><span style={{color:"#dc2626"}}>{t.from}</span> <span style={{color:"#fff", fontWeight: 900, padding: "2px 8px", background: "#ef4444", borderRadius: 12, fontSize: 10, margin: "0 4px"}}>NỢ</span> <span style={{color:"#059669"}}>{t.to}</span></div>
-                  <span style={{fontWeight:800,fontSize:14,color:"#7c3aed"}}>{fmt(t.amount)}</span>
-                </div>
-              ))}
+                ):transactions.map((t,i)=>{
+                  const fromRes = resolveMemberDisplay(t.from);
+                  const toRes = resolveMemberDisplay(t.to);
+                  return (
+                    <div key={i} style={{display:"flex",alignItems:"center",gap:4,padding:"9px 0",borderBottom:i<transactions.length-1?"1px solid #f3f4f6":"none"}}>
+                      <Av name={fromRes.name} size={32} ci={members.indexOf(t.from)} avatar={group.memberDetails?.[t.from]?.avatar}/>
+                      <div style={{flex:1,fontSize:13,fontWeight:700}}>
+                        <span style={{color:"#dc2626", display: "inline-flex", alignItems: "center", gap: 3}}>
+                          {fromRes.name}
+                          {fromRes.isLeader && <span style={{fontSize: 9, padding: "1px 4px", background: "#fef3c7", color: "#d97706", borderRadius: 4, fontWeight: 800, marginLeft: 2}}>TRƯỞNG NHÓM</span>}
+                          {fromRes.isMe && <span style={{fontWeight: 400, fontSize: 11, color: "#94a3b8"}}>(Bạn)</span>}
+                        </span> 
+                        <span style={{color:"#fff", fontWeight: 900, padding: "2px 8px", background: "#ef4444", borderRadius: 12, fontSize: 10, margin: "0 4px"}}>NỢ</span> 
+                        <span style={{color:"#059669", display: "inline-flex", alignItems: "center", gap: 3}}>
+                          {toRes.name}
+                          {toRes.isLeader && <span style={{fontSize: 9, padding: "1px 4px", background: "#fef3c7", color: "#d97706", borderRadius: 4, fontWeight: 800, marginLeft: 2}}>TRƯỞNG NHÓM</span>}
+                          {toRes.isMe && <span style={{fontWeight: 400, fontSize: 11, color: "#94a3b8"}}>(Bạn)</span>}
+                        </span>
+                      </div>
+                      <span style={{fontWeight:800,fontSize:14,color:"#7c3aed"}}>{fmt(t.amount)}</span>
+                    </div>
+                  );
+                })}
             </Card>
           </>
         )}
 
         {subTab==="expenses"&&(
           <>
-            {[...expenses].reverse().map((e)=>(
-              <Card key={e.id} onClick={()=>setSelectedBill(e)} style={{padding:"12px 13px",marginBottom:8}}>
-                <div style={{display:"flex",alignItems:"center",gap:9}}>
-                  <div style={{width:38,height:38,borderRadius:11,background:"#ede9fe",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>🧾</div>
-                  <div style={{flex:1}}>
-                    <div style={{fontWeight:800,fontSize:14}}>{e.desc}</div>
-                    <div style={{fontSize:11,color:"#7c3aed",fontWeight:600}}>
-                      {Object.keys(e.payers).filter(k => (e.payers[k] || 0) > 0).join(", ")}
-                    </div>
-                  </div>
-                  <div style={{textAlign:"right"}}><div style={{fontWeight:800,fontSize:13,color:"#db2777"}}>{fmt(e.amount)}</div></div>
-                </div>
-              </Card>
-            ))}
+            {[...expenses, ...(payments || [])]
+              .sort((a, b) => (b.ts || 0) - (a.ts || 0))
+              .map((item) => {
+                const isExpense = 'desc' in item;
+                if (isExpense) {
+                  const e = item as Expense;
+                  return (
+                    <Card key={e.id} onClick={()=>setSelectedBill(e)} style={{padding:"12px 8px",marginBottom:8, cursor: "pointer"}}>
+                      <div style={{display:"flex",alignItems:"center",gap:7}}>
+                        <div style={{width:38,height:38,borderRadius:11,background:"#ede9fe",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>🧾</div>
+                        <div style={{flex:1}}>
+                          <div style={{fontWeight:800,fontSize:14}}>{e.desc}</div>
+                          <div style={{fontSize:11,color:"#7c3aed",fontWeight:600}}>
+                            {Object.keys(e.payers).filter(k => (e.items ? e.payers[k] : (e.payers[k] || 0)) > 0).join(", ")}
+                          </div>
+                        </div>
+                        <div style={{textAlign:"right"}}><div style={{fontWeight:800,fontSize:13,color:"#db2777"}}>{fmt(e.amount)}</div></div>
+                      </div>
+                    </Card>
+                  );
+                } else {
+                  const p = item as Payment;
+                  return (
+                    <Card key={p.id} style={{padding:"12px 8px",marginBottom:8, border: "1px solid #10b981", background: "#f0fdf4"}}>
+                      <div style={{display:"flex",alignItems:"center",gap:7}}>
+                        <div style={{width:38,height:38,borderRadius:11,background:"#dcfce7",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>💸</div>
+                        <div style={{flex:1}}>
+                          <div style={{fontWeight:800,fontSize:14}}>{p.from} trả {p.to}</div>
+                          <div style={{fontSize:11,color:"#059669",fontWeight:600}}>{p.note || "Xác nhận trả nợ"}</div>
+                        </div>
+                        <div style={{textAlign:"right"}}><div style={{fontWeight:800,fontSize:13,color:"#059669"}}>{fmt(p.amount)}</div></div>
+                      </div>
+                    </Card>
+                  );
+                }
+              })}
+            {(expenses.length === 0 && (!payments || payments.length === 0)) && (
+              <div style={{textAlign:"center", padding: 40, color: "#94a3b8"}}>
+                <div style={{fontSize: 40, marginBottom: 10}}>🧾</div>
+                <div style={{fontWeight: 700}}>Chưa có hoạt động nào</div>
+                <div style={{fontSize: 12}}>Các khoản chi và thanh toán sẽ hiện ở đây</div>
+              </div>
+            )}
           </>
         )}
 
@@ -1510,13 +1618,17 @@ function GroupView({ group, friends, onUpdate, onDelete, onLeave, onBack }: { gr
                            {group.memberDetails[m].email && <span>📧 {group.memberDetails[m].email}</span>}
                         </div>
                       )}
-                      <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
-                        {(balances[m] || 0) >= 0 ? "🟢 Đang dư tiền" : "🔴 Đang nợ tiền"}
+                      {Math.abs(Math.round(balances[m] || 0)) >= 1 && (
+                        <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
+                          {(balances[m] || 0) > 0 ? "🟢 Đang dư tiền" : "🔴 Đang nợ tiền"}
+                        </div>
+                      )}
+                    </div>
+                    {Math.abs(Math.round(balances[m] || 0)) >= 1 && (
+                      <div style={{ fontWeight: 800, fontSize: 14, color: (balances[m] || 0) > 0 ? "#16a34a" : "#dc2626" }}>
+                        {(balances[m] || 0) > 0 ? "+" : ""}{fmt(balances[m] || 0)}
                       </div>
-                    </div>
-                    <div style={{ fontWeight: 800, fontSize: 14, color: (balances[m] || 0) >= 0 ? "#16a34a" : "#dc2626" }}>
-                      {(balances[m] || 0) >= 0 ? "+" : ""}{fmt(balances[m] || 0)}
-                    </div>
+                    )}
                   </div>
                 </Card>
               ))}
@@ -1588,17 +1700,19 @@ function FriendActionModal({ friend, groups, onClose, onPay }: { friend: Friend,
         </div>
       </div>
 
-      <div style={{ background: friendBalances.netBalance >= 0 ? "#f0fdf4" : "#fef2f2", borderRadius: 16, padding: "16px", marginBottom: 20, textAlign: "center", border: `2px solid ${friendBalances.netBalance >= 0 ? "#bbf7d0" : "#fecaca"}` }}>
-        <div style={{ fontSize: 13, fontWeight: 800, color: friendBalances.netBalance >= 0 ? "#16a34a" : "#dc2626", textTransform: "uppercase", marginBottom: 6 }}>
-          {friendBalances.netBalance >= 0 ? "💰 ĐANG DƯ" : "🔴 ĐANG NỢ"}
+      {Math.abs(Math.round(friendBalances.netBalance)) >= 1 && (
+        <div style={{ background: friendBalances.netBalance >= 0 ? "#f0fdf4" : "#fef2f2", borderRadius: 16, padding: "16px", marginBottom: 20, textAlign: "center", border: `2px solid ${friendBalances.netBalance >= 0 ? "#bbf7d0" : "#fecaca"}` }}>
+          <div style={{ fontSize: 13, fontWeight: 800, color: friendBalances.netBalance >= 0 ? "#16a34a" : "#dc2626", textTransform: "uppercase", marginBottom: 6 }}>
+            {friendBalances.netBalance >= 0 ? "💰 ĐANG DƯ" : "🔴 ĐANG NỢ"}
+          </div>
+          <div style={{ fontSize: 24, fontWeight: 900, color: friendBalances.netBalance >= 0 ? "#16a34a" : "#dc2626" }}>
+            {fmt(Math.abs(friendBalances.netBalance))}
+          </div>
         </div>
-        <div style={{ fontSize: 24, fontWeight: 900, color: friendBalances.netBalance >= 0 ? "#16a34a" : "#dc2626" }}>
-          {fmt(Math.abs(friendBalances.netBalance))}
-        </div>
-      </div>
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 20 }}>
-        <Btn onClick={sendReminder} disabled={!friend.email} style={{ background: friend.email ? "#2563eb" : "#cbd5e1" }}>
+        <Btn onClick={sendReminder} disabled={!friend.email || Math.abs(Math.round(friendBalances.netBalance)) < 1} style={{ background: (friend.email && Math.abs(Math.round(friendBalances.netBalance)) >= 1) ? "#2563eb" : "#cbd5e1" }}>
           📧 {friend.email ? "Nhắc nợ" : "Không có mail"}
         </Btn>
         <Btn onClick={() => {
@@ -1615,9 +1729,11 @@ function FriendActionModal({ friend, groups, onClose, onPay }: { friend: Friend,
           <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: "#f8fafc", padding: "10px 12px", borderRadius: 12 }}>
             <span style={{ fontSize: 20 }}>{gd.emoji}</span>
             <span style={{ flex: 1, fontSize: 13, fontWeight: 600 }}>{gd.name}</span>
-            <span style={{ fontWeight: 800, fontSize: 13, color: gd.balance >= 0 ? "#16a34a" : "#dc2626" }}>
-              {gd.balance >= 0 ? "+" : ""}{fmt(gd.balance)}
-            </span>
+            {Math.abs(Math.round(gd.balance)) >= 1 && (
+              <span style={{ fontWeight: 800, fontSize: 13, color: gd.balance >= 0 ? "#16a34a" : "#dc2626" }}>
+                {gd.balance >= 0 ? "+" : ""}{fmt(gd.balance)}
+              </span>
+            )}
           </div>
         ))}
         {friendBalances.groupDetails.length === 0 && <div style={{ textAlign: "center", color: "#94a3b8", fontSize: 12, padding: 10 }}>Không có nhóm chung nào.</div>}
@@ -1631,6 +1747,7 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
   const [email, setEmail] = useState("");
   const [selectedFriend, setSelectedFriend] = useState<Friend | null>(null);
   const [activeTab, setActiveTab] = useState<"list" | "pending">("list");
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const add = () => {
     if (!name.trim()) return;
@@ -1722,7 +1839,32 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
                   <div style={{ fontWeight: 700, fontSize: 14 }}>{f.name}</div>
                   {f.email && <div style={{ fontSize: 11, color: "#94a3b8" }}>✉️ {f.email}</div>}
                 </div>
-                <button onClick={(e) => { e.stopPropagation(); if(confirm("Xóa người bạn này?") && f.id) onRemoveFriend(f.id); }} style={{ background: "#fef2f2", border: "none", color: "#dc2626", borderRadius: 8, width: 32, height: 32, cursor: "pointer", fontWeight: 700, fontSize: 16 }}>×</button>
+                {deletingId === f.id ? (
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); setDeletingId(null); }} 
+                      style={{ background: "#e2e8f0", border: "none", color: "#475569", borderRadius: 8, padding: "6px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}
+                    >
+                      Hủy
+                    </button>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); if (f.id) onRemoveFriend(f.id); setDeletingId(null); }} 
+                      style={{ background: "#dc2626", border: "none", color: "#fff", borderRadius: 8, padding: "6px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}
+                    >
+                      Xóa
+                    </button>
+                  </div>
+                ) : (
+                  <button 
+                    onClick={(e) => { 
+                      e.stopPropagation(); 
+                      setDeletingId(f.id || null);
+                    }} 
+                    style={{ background: "#fef2f2", border: "none", color: "#dc2626", borderRadius: 8, width: 32, height: 32, cursor: "pointer", fontWeight: 700, fontSize: 16 }}
+                  >
+                    ×
+                  </button>
+                )}
               </div>
             </Card>
           ))}
@@ -1740,7 +1882,32 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
                     <span>✉️ {f.email}</span>
                   </div>
                 </div>
-                <button onClick={(e) => { e.stopPropagation(); if(confirm("Hủy lời mời này?") && f.id) onRemoveFriend(f.id); }} style={{ background: "#fef2f2", border: "none", color: "#dc2626", borderRadius: 8, width: 32, height: 32, cursor: "pointer", fontWeight: 700, fontSize: 16 }}>×</button>
+                {deletingId === f.id ? (
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); setDeletingId(null); }} 
+                      style={{ background: "#e2e8f0", border: "none", color: "#475569", borderRadius: 8, padding: "6px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}
+                    >
+                      Bỏ
+                    </button>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); if (f.id) onRemoveFriend(f.id); setDeletingId(null); }} 
+                      style={{ background: "#dc2626", border: "none", color: "#fff", borderRadius: 8, padding: "6px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}
+                    >
+                      Hủy lời mời
+                    </button>
+                  </div>
+                ) : (
+                  <button 
+                    onClick={(e) => { 
+                      e.stopPropagation(); 
+                      setDeletingId(f.id || null);
+                    }} 
+                    style={{ background: "#fef2f2", border: "none", color: "#dc2626", borderRadius: 8, width: 32, height: 32, cursor: "pointer", fontWeight: 700, fontSize: 16 }}
+                  >
+                    ×
+                  </button>
+                )}
               </div>
             </Card>
           ))}
@@ -1751,14 +1918,9 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
   );
 }
 
-function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { groups: Group[], friends: Friend[], onSelectGroup: (g: Group) => void, onCreateGroup: (g: Group, invites: string[]) => void, onJoinGroup: () => void }) {
+function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { groups: Group[], friends: Friend[], onSelectGroup: (g: Group) => void, onCreateGroup: (g: Group) => void }) {
   const [showCreate,setShowCreate] = useState(false);
-  const [showJoin,setShowJoin] = useState(false);
   const [gName,setGName] = useState(""); const [gEmoji,setGEmoji] = useState("🎉");
-  const [emails,setEmails] = useState<string[]>([]);
-  const [joinCode,setJoinCode] = useState("");
-
-  const toggleEmail = (email: string) => setEmails(s=>s.includes(email)?s.filter(x=>x!==email):[...s,email]);
 
   const createGroup = () => {
     if(!gName.trim()) {
@@ -1769,7 +1931,7 @@ function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { gro
       id:String(Date.now()),
       name:gName.trim(),
       emoji:gEmoji,
-      members:[], // Members will be added as they accept invitations
+      members:[],
       memberUids:[],
       leader: auth.currentUser?.displayName || "Trưởng nhóm",
       leaderUid: auth.currentUser?.uid || "",
@@ -1778,15 +1940,8 @@ function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { gro
       feed:[{id:String(Date.now()),type:"group",text:`Nhóm "${gName.trim()}" được tạo`,ts:Date.now(),icon:"🎉"}],
       inviteCode:genCode(),
       dueDate:""
-    }, emails);
-    setGName("");setEmails([]);setShowCreate(false);
-  };
-
-  const joinGroup = () => {
-    const g=groups.find(g=>g.inviteCode===joinCode.toUpperCase().trim());
-    if(!g) return;
-    setJoinCode("");setShowJoin(false);
-    onSelectGroup(g);
+    });
+    setGName("");setShowCreate(false);
   };
 
   return (
@@ -1798,69 +1953,7 @@ function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { gro
             {EMOJIS.map(e=><button key={e} onClick={()=>setGEmoji(e)} style={{width:38,height:38,borderRadius:9,fontSize:20,border:gEmoji===e?"2.5px solid #7c3aed":"2px solid #e2e8f0",background:gEmoji===e?"#f5f3ff":"#fff",cursor:"pointer"}}>{e}</button>)}
           </div>
           <Input placeholder="Tên nhóm..." value={gName} onChange={(e: any)=>setGName(e.target.value)} style={{marginBottom:15}}/>
-          
-          <div style={{fontWeight:700,fontSize:12,color:"#64748b",marginBottom:8}}>MỜI NHANH TỪ BẠN BÈ</div>
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", maxHeight: 80, overflowY: "auto", background: "#f8fafc", padding: 8, borderRadius: 8, border: "1px solid #e2e8f0", marginBottom: 15 }}>
-            {friends.filter(f => f.email && !emails.includes(f.email)).map((f, i) => (
-              <button key={i} onClick={() => { setEmails([...emails, f.email!]); }} style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 8px", borderRadius: 12, border: "1px solid #7c3aed", background: "#fff", cursor: "pointer", fontSize: 11, fontWeight: 600, color: "#7c3aed" }}>
-                {f.name} ({f.email})
-              </button>
-            ))}
-            {friends.filter(f => f.email && !emails.includes(f.email)).length === 0 && <div style={{ fontSize: 10, color: "#94a3b8" }}>Không có bạn bè mới có email để mời nhanh.</div>}
-          </div>
-
-          <div style={{fontWeight:700,fontSize:12,color:"#64748b",marginBottom:8}}>MỜI BẠN BÈ QUA EMAIL ({emails.length})</div>
-          <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12,maxHeight:150,overflowY:"auto",background:"#f8fafc",padding:10,borderRadius:12,border:"1px solid #e2e8f0"}}>
-            {emails.map((email, i) => (
-              <div key={i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:"#fff",padding:"8px 12px",borderRadius:10,border:"1px solid #f1f5f9"}}>
-                <div style={{display:"flex",alignItems:"center",gap:8}}>
-                  <div style={{width:24,height:24,borderRadius:"50%",background:"#ede9fe",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12}}>📧</div>
-                  <span style={{fontSize:13,fontWeight:600}}>{email}</span>
-                </div>
-                <button onClick={() => toggleEmail(email)} style={{background:"none",border:"none",color:"#dc2626",fontSize:18,cursor:"pointer"}}>×</button>
-              </div>
-            ))}
-            {emails.length === 0 && <div style={{fontSize:11,color:"#94a3b8",textAlign:"center",padding:10}}>Chưa có lời mời nào. Thêm email bên dưới!</div>}
-          </div>
-
-          <div style={{display:"flex",gap:6,marginBottom:15}}>
-            <Input 
-              placeholder="Nhập email người bạn..." 
-              id="new-member-email"
-              onKeyDown={(e: any) => {
-                if (e.key === "Enter") {
-                  const val = e.target.value.trim();
-                  if (val && !emails.includes(val) && val.includes("@")) {
-                    setEmails([...emails, val]);
-                    e.target.value = "";
-                  }
-                }
-              }}
-              style={{fontSize:13, flex:1}}
-            />
-            <button 
-              onClick={() => {
-                const input = document.getElementById("new-member-email") as HTMLInputElement;
-                const val = input?.value.trim();
-                if (val && !emails.includes(val) && val.includes("@")) {
-                  setEmails([...emails, val]);
-                  input.value = "";
-                }
-              }}
-              style={{background:"#7c3aed",color:"#fff",border:"none",borderRadius:10,padding:"0 15px",fontWeight:700,fontSize:18,cursor:"pointer"}}
-            >+</button>
-          </div>
-
-          <div style={{fontSize:11, color:"#94a3b8", marginBottom:15, fontStyle:"italic"}}>* Hệ thống sẽ gửi email mời tham gia nhóm tới tất cả địa chỉ trên sau khi bạn tạo nhóm.</div>
-
           <Btn onClick={createGroup} style={{width:"100%", padding:"14px", fontSize: 14}}>✨ Tạo nhóm ngay</Btn>
-        </Modal>
-      )}
-      {showJoin&&(
-        <Modal onClose={()=>setShowJoin(false)}>
-          <div style={{fontWeight:800,fontSize:16,marginBottom:14}}>🔗 Tham gia nhóm</div>
-          <Input placeholder="Mã mời..." value={joinCode} onChange={(e: any)=>setJoinCode(e.target.value)} style={{marginBottom:8,textAlign:"center",letterSpacing:4}}/>
-          <Btn onClick={joinGroup} style={{width:"100%"}}>Tham gia</Btn>
         </Modal>
       )}
 
@@ -1871,11 +1964,9 @@ function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { gro
         >
           ✨ Tạo nhóm
         </button>
-        <button onClick={()=>setShowJoin(true)} style={{flex:1,background:"linear-gradient(135deg,#2563eb,#60a5fa)",color:"#fff",border:"none",borderRadius:12,padding:"11px",fontWeight:700,fontSize:13,cursor:"pointer"}}>🔗 Nhập mã mời</button>
       </div>
 
       {groups.map((g)=>{
-        const total = (g.expenses || []).reduce((s,e)=>s+e.amount,0);
         const groupColorIndex = g.id.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
         return(
           <Card key={g.id} onClick={()=>onSelectGroup(g)} style={{padding:"14px 16px",marginBottom:10, transition: "transform 0.2s"}}>
@@ -1890,7 +1981,6 @@ function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { gro
                 </div>
               </div>
               <div style={{textAlign:"right",display:"flex",alignItems:"center",gap:8}}>
-                <div style={{fontWeight:900,fontSize:16,color:"#7c3aed"}}>{fmtShort(total)}</div>
                 <div style={{color:"#cbd5e1",fontSize:20,fontWeight:300}}>›</div>
               </div>
             </div>
@@ -1925,23 +2015,60 @@ const DEFAULT_PREFS: UserPrefs = {
   emailOnMonthlyReport: true
 };
 
+function GroupSuccessModal({ group, onClose }: { group: Group, onClose: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const link = `${window.location.origin}/?joinCode=${group.inviteCode}`;
+
+  const copyLink = () => {
+    navigator.clipboard.writeText(link);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <Modal onClose={onClose}>
+      <div style={{ textAlign: "center", marginBottom: 20 }}>
+        <div style={{ fontSize: 40, marginBottom: 10 }}>🎉</div>
+        <div style={{ fontWeight: 800, fontSize: 18, color: "#1e1e2e" }}>Tạo nhóm thành công!</div>
+        <div style={{ fontSize: 13, color: "#64748b", marginTop: 4 }}>Nhóm "{group.name}" đã sẵn sàng.</div>
+      </div>
+
+      <Card style={{ textAlign: "center", background: "#f8fafc" }}>
+        <div style={{ fontWeight: 700, fontSize: 12, color: "#475569", marginBottom: 16 }}>QUÉT MÃ HOẶC COPY LINK ĐỂ THAM GIA</div>
+        <div style={{ background: "#fff", padding: 16, borderRadius: 16, display: "inline-block", border: "1px solid #e2e8f0", marginBottom: 16 }}>
+           <QRCode value={link} size={150} level="Q" />
+        </div>
+        <div style={{ display: "flex", gap: 8, background: "#ede9fe", padding: 8, borderRadius: 12, alignItems: "center" }}>
+          <div style={{ flex: 1, fontSize: 11, color: "#7c3aed", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{link}</div>
+          <button onClick={copyLink} style={{ background: "#7c3aed", color: "#fff", border: "none", padding: "6px 12px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>{copied ? "Đã copy" : "Copy"}</button>
+        </div>
+      </Card>
+
+      <Btn onClick={onClose} style={{ width: "100%", padding: 14 }}>Vào nhóm ngay →</Btn>
+    </Modal>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState("groups");
+  const [createdGroupParams, setCreatedGroupParams] = useState<{group: Group} | null>(null);
+  const [joinCode, setJoinCode] = useState<string | null>(null);
+  const [groupToJoin, setGroupToJoin] = useState<Group | null>(null);
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [userPrefs, setUserPrefs] = useState<UserPrefs>(DEFAULT_PREFS);
   const [groups, setGroups] = useState<Group[]>([]);
   const [friends, setFriends] = useState<Friend[]>([]);
-  const [pendingInvites, setPendingInvites] = useState<Invitation[]>([]);
   const [activeGroup, setActiveGroup] = useState<Group | null>(null);
   const [loading, setLoading] = useState(true);
-  const [inviteId, setInviteId] = useState<string | null>(null);
+  const [loginLoading, setLoginLoading] = useState(false);
 
   useEffect(() => {
+    testConnection();
     const params = new URLSearchParams(window.location.search);
-    const id = params.get("inviteId");
-    if (id) setInviteId(id);
+    const code = params.get("joinCode");
+    if (code) setJoinCode(code);
   }, []);
   
   // Security & Profile state (Passcode might need to be in Firestore too, but let's keep it simple for now)
@@ -1950,6 +2077,9 @@ export default function App() {
   const [enteredPass, setEnteredPass] = useState("");
   const [profilePic, setProfilePic] = useState<string | null>(null);
   const [showEmailSettings, setShowEmailSettings] = useState(false);
+  const [showAvatarModal, setShowAvatarModal] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [showSecurityModal, setShowSecurityModal] = useState(false);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (u) => {
@@ -1962,7 +2092,7 @@ export default function App() {
             const data = userSnap.data();
             setProfile({ 
               uid: u.uid, 
-              name: data.name || u.displayName || "Bạn",
+              name: data.name || u.displayName || u.email?.split("@")[0] || "Thành viên",
               avatar: data.avatar || "🐱",
               email: data.email || u.email || "",
               createdAt: data.createdAt?.seconds ? data.createdAt.seconds * 1000 : Date.now()
@@ -1984,55 +2114,70 @@ export default function App() {
     return unsub;
   }, []);
 
-  const deleteAccount = async () => {
+  const executeDeleteAccount = async () => {
     const currentUser = auth.currentUser;
-    if (!currentUser) {
-      alert("Không tìm thấy phiên đăng nhập. Vui lòng đăng nhập lại.");
-      return;
-    }
-
-    const confirm = window.confirm("⚠️ CẢNH BÁO TỐI CAO: BẠN SẮP XÓA VĨNH VIỄN TÀI KHOẢN!\n\nHành động này sẽ XÓA SẠCH:\n1. Hồ sơ và danh sách bạn bè\n2. Các nhóm do bạn làm trưởng nhóm (bao gồm tất cả hóa đơn bên trong)\n3. Thông tin đăng nhập của bạn\n\nBạn có chắc chắn 100% muốn xóa toàn bộ dữ liệu và tài khoản này không? (Không thể khôi phục!)");
-    if (!confirm) return;
-
-    alert("⚙️ Hệ thống đang bắt đầu xóa toàn bộ dữ liệu của bạn... Vui lòng không đóng trình duyệt.");
+    if (!currentUser) return;
 
     try {
-      setLoading(true);
-      // 1. Delete friends
-      const friendsSnap = await getDocs(collection(db, "users", currentUser.uid, "friends"));
-      for (const d of friendsSnap.docs) await deleteDoc(d.ref);
-      
-      // 2. Delete groups where user is leader
-      const groupsSnap = await getDocs(query(collection(db, "groups"), where("leaderUid", "==", currentUser.uid)));
-      for (const d of groupsSnap.docs) {
-        // Delete subcollections first (expenses, payments, feed)
-        const subcoll = ["expenses", "payments", "feed"];
-        for (const sc of subcoll) {
-          const snap = await getDocs(collection(db, "groups", d.id, sc));
-          for (const sd of snap.docs) await deleteDoc(sd.ref);
+      setShowDeleteConfirm(false);
+
+      // Re-authenticate user before proceeding with deletion
+      try {
+        await reauthenticateWithPopup(currentUser, googleProvider);
+      } catch (authErr: any) {
+        if (authErr.code === "auth/popup-blocked") {
+          alert("⚠️ Trình duyệt của bạn đang chặn popup đăng nhập của Google.\n\nVui lòng BẤM VÀO NÚT 'Mở trong tab mới' (Open in New Tab) ở góc trên bên phải màn hình để tiếp tục xóa tài khoản.");
+        } else if (authErr.code === "auth/cancelled-popup-request" || authErr.code === "auth/popup-closed-by-user") {
+          return;
+        } else {
+          console.error("Reauth error:", authErr);
+          alert("❌ Xác thực thất bại, không thể xóa tài khoản. Vui lòng thử lại: " + authErr.message);
         }
-        await deleteDoc(d.ref);
+        return;
       }
 
-      // 3. Delete invitations sent by user
-      const invitesSnap = await getDocs(query(collection(db, "invitations"), where("email", "==", currentUser.email)));
-      for (const d of invitesSnap.docs) await deleteDoc(d.ref);
+      setLoading(true);
 
-      // 4. Delete user doc
-      await deleteDoc(doc(db, "users", currentUser.uid));
+      try {
+        // 1. Delete friends
+        const friendsSnap = await getDocs(collection(db, "users", currentUser.uid, "friends"));
+        for (const d of friendsSnap.docs) await deleteDoc(d.ref);
+      } catch (err) { console.error("Error deleting friends:", err); throw new Error("Lỗi khi xóa bạn bè"); }
       
-      // 5. Delete auth user (might require recent login)
-      const email = currentUser.email;
-      await currentUser.delete();
-      alert(`Tài khoản (${email}) và toàn bộ dữ liệu đã được xóa sạch khỏi hệ thống!`);
-      window.location.reload();
+      try {
+        // 2. Delete groups where user is leader
+        const groupsSnap = await getDocs(query(collection(db, "groups"), where("leaderUid", "==", currentUser.uid)));
+        for (const d of groupsSnap.docs) {
+          const subcoll = ["expenses", "payments", "feed"];
+          for (const sc of subcoll) {
+            const snap = await getDocs(collection(db, "groups", d.id, sc));
+            for (const sd of snap.docs) await deleteDoc(sd.ref);
+          }
+          await deleteDoc(d.ref);
+        }
+      } catch (err) { console.error("Error deleting groups:", err); throw new Error("Lỗi khi xóa nhóm/hóa đơn. Chi tiết: " + String(err)); }
+
+      try {
+        // 4. Delete user doc
+        await deleteDoc(doc(db, "users", currentUser.uid));
+      } catch (err) { console.error("Error deleting user doc:", err); throw new Error("Lỗi khi xóa hồ sơ cá nhân"); }
+      
+      try {
+        // 5. Delete auth user
+        const email = currentUser.email;
+        await currentUser.delete();
+        
+        alert(`✅ Thành công: Tài khoản (${email}) đã được xóa hoàn toàn.`);
+        window.location.reload();
+      } catch (err) { console.error("Error deleting auth:", err); throw err; }
     } catch (err: any) {
       setLoading(false);
+      console.error("Delete Error:", err);
       if (err.code === 'auth/requires-recent-login') {
         alert("🔒 Vì lý do bảo mật, bạn cần đăng nhập lại trước khi xóa tài khoản.");
         await logout();
       } else {
-        handleFirestoreError(err, OperationType.DELETE, "account");
+        alert("❌ Có lỗi xảy ra khi xóa tài khoản: " + (err.message || String(err)));
       }
     }
   };
@@ -2055,6 +2200,25 @@ export default function App() {
       return;
     }
 
+    // Handle joinCode dynamically if present
+    if (joinCode) {
+      const loadGroupForJoin = async () => {
+        try {
+          const q = query(collection(db, "groups"), where("inviteCode", "==", joinCode));
+          const snap = await getDocs(q);
+          if (!snap.empty) {
+            setGroupToJoin({ ...snap.docs[0].data(), id: snap.docs[0].id } as Group);
+          } else {
+            console.warn("Invalid or expired join code");
+            setJoinCode(null);
+          }
+        } catch (e) {
+          console.error("Error loading group for joinCode", e);
+        }
+      };
+      loadGroupForJoin();
+    }
+
     // Sync friends
     const friendsRef = collection(db, "users", user.uid, "friends");
     const unsubFriends = onSnapshot(friendsRef, (snap) => {
@@ -2068,28 +2232,36 @@ export default function App() {
       setGroups(snap.docs.map(d => ({ ...d.data(), id: d.id } as any)));
     }, err => handleFirestoreError(err, OperationType.LIST, "groups"));
 
-    // Sync pending invitations for current user email
-    let unsubInvites = () => {};
-    if (user.email) {
-      const invitesRef = collection(db, "invitations");
-      const invitesQuery = query(invitesRef, where("email", "==", user.email));
-      unsubInvites = onSnapshot(invitesQuery, (snap) => {
-        setPendingInvites(snap.docs.map(d => ({ ...d.data(), id: d.id } as Invitation)));
-      }, err => handleFirestoreError(err, OperationType.LIST, "pending invitations"));
-    }
-
     return () => {
       unsubFriends();
       unsubGroups();
-      unsubInvites();
     };
   }, [user]);
 
   const login = async () => {
+    if (loginLoading) return;
+    setLoginLoading(true);
+    console.log("Starting login process...");
     try {
+      if (!auth) {
+        throw new Error("Dịch vụ xác thực chưa sẵn sàng. Vui lòng tải lại trang.");
+      }
       await signInWithPopup(auth, googleProvider);
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, "login");
+      console.log("Login successful");
+    } catch (err: any) {
+      console.error("Login error:", err);
+      if (err.code === "auth/popup-blocked") {
+        alert("⚠️ Trình duyệt của bạn đang chặn popup đăng nhập của Google.\n\nVui lòng BẤM VÀO NÚT 'Mở trong tab mới' (Open in New Tab) ở góc trên bên phải màn hình để có thể đăng nhập.");
+      } else if (err.code === "auth/cancelled-popup-request" || err.code === "auth/popup-closed-by-user") {
+        console.log("Login cancelled by user");
+      } else {
+        alert("Lỗi đăng nhập: " + (err.message || String(err)) + "\n\nGợi ý: Thử nhấn 'Mở trong tab mới' (Open in New Tab) ở góc phải màn hình.");
+        try {
+          handleFirestoreError(err, OperationType.WRITE, "login");
+        } catch (e) { }
+      }
+    } finally {
+      setLoginLoading(false);
     }
   };
 
@@ -2149,7 +2321,44 @@ export default function App() {
   const removeFriend = async (id: string) => {
     if (!user) return;
     try {
+      const friendToRemove = friends.find(f => f.id === id);
+      if (!friendToRemove) return;
+      const { name: friendName, email: friendEmail } = friendToRemove;
+
+      // 1. Delete friend from user's friends list
       await deleteDoc(doc(db, "users", user.uid, "friends", id));
+
+      // 2. Remove from all groups this user is leading or part of
+      for (const g of groups) {
+        let isUpdated = false;
+        let newMembers = [...g.members];
+        let newUids = [...(g.memberUids || [])];
+        let newDetails = { ...(g.memberDetails || {}) };
+
+        // Remove by Name
+        if (newMembers.includes(friendName)) {
+           // Only allow removal if the current user is the leader
+           const isLeader = g.leaderUid ? g.leaderUid === user.uid : g.leader === (profile?.name);
+           if (isLeader && g.leader !== friendName) {
+             const idx = newMembers.indexOf(friendName);
+             newMembers.splice(idx, 1);
+             if (newUids[idx]) newUids.splice(idx, 1);
+             delete newDetails[friendName];
+             isUpdated = true;
+           }
+        }
+
+        // Also clean up by Email if they are in memberDetails but maybe named differently?
+        // Actually, name is the primary key in members array.
+        
+        if (isUpdated) {
+          await updateDoc(doc(db, "groups", g.id), {
+            members: newMembers,
+            memberUids: newUids,
+            memberDetails: newDetails
+          });
+        }
+      }
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, "friends");
     }
@@ -2174,9 +2383,8 @@ export default function App() {
     }
   };
 
-  const createGroup = async (g: any, invites: string[]) => {
+  const createGroup = async (g: any) => {
     if (!user || !profile) return;
-    const filteredInvites = invites.filter(e => e !== user.email);
     try {
       const groupData = {
         ...g,
@@ -2185,23 +2393,13 @@ export default function App() {
         leader: profile.name,
         leaderUid: user.uid,
         createdBy: user.uid,
-        createdAt: serverTimestamp()
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
       };
       delete groupData.id;
 
       const docRef = await addDoc(collection(db, "groups"), groupData);
       
-      // Create Invitations
-      for (const email of filteredInvites) {
-        const invDoc = await addDoc(collection(db, "invitations"), {
-          groupId: docRef.id,
-          inviterName: profile.name,
-          email,
-          ts: Date.now()
-        });
-        sendEmailInvite(email, profile.name, g.name, invDoc.id);
-      }
-
       // Add initial feed
       await addDoc(collection(db, "groups", docRef.id, "feed"), {
         type: "group",
@@ -2210,8 +2408,10 @@ export default function App() {
         icon: "🎉"
       });
 
-      setActiveGroup({ ...groupData, id: docRef.id, leaderUid: user.uid });
+      const newGroup = { ...groupData, id: docRef.id, leaderUid: user.uid };
+      setActiveGroup(newGroup);
       setTab("active");
+      setCreatedGroupParams({ group: newGroup as Group });
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, "groups");
     }
@@ -2258,9 +2458,24 @@ export default function App() {
 
   const handlePicUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      const url = URL.createObjectURL(file);
-      setProfilePic(url);
+    if (file && profile) {
+      if (file.size > 500 * 1024) {
+        alert("🚨 File size too large (max 500KB)");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onloadend = async () => {
+        const base64Avatar = reader.result as string;
+        try {
+          await updateDoc(doc(db, "users", profile.uid), { avatar: base64Avatar });
+          setProfile({ ...profile, avatar: base64Avatar });
+          setProfilePic(base64Avatar);
+          setShowAvatarModal(false);
+        } catch (err) {
+          handleFirestoreError(err, OperationType.UPDATE, "users");
+        }
+      };
+      reader.readAsDataURL(file);
     }
   };
 
@@ -2281,22 +2496,6 @@ export default function App() {
     );
   }
 
-  if (inviteId) {
-    return (
-      <JoinGroupView 
-        inviteId={inviteId} 
-        profile={profile}
-        onJoined={(g) => {
-          setInviteId(null);
-          setActiveGroup(g);
-          setTab("active");
-          // Clear URL params
-          window.history.replaceState({}, document.title, window.location.pathname);
-        }} 
-      />
-    );
-  }
-
   if (!user) {
     return (
       <div style={{minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:"linear-gradient(135deg,#4c1d95 0%,#7c3aed 40%,#a78bfa 100%)", color:"#fff", padding:20, textAlign: "center"}}>
@@ -2305,9 +2504,13 @@ export default function App() {
         <p style={{fontSize: 14, color: "rgba(255,255,255,0.8)", marginBottom: 30, maxWidth: 300}}>
           Ứng dụng chia sẻ hóa đơn thông minh và minh bạch. Đăng nhập để bắt đầu!
         </p>
-        <Btn onClick={login} style={{width: 260, fontSize: 16, padding: "14px 20px"}}>
-          🚀 Đăng nhập bằng Google
+        <Btn onClick={login} disabled={loginLoading} style={{width: 260, fontSize: 16, padding: "14px 20px", marginBottom: 15, display: "flex", alignItems: "center", justifyContent: "center", gap: 10}}>
+          {loginLoading ? <Loader2 className="animate-spin" size={20} /> : "🚀"} 
+          {loginLoading ? "Đang xử lý..." : "Đăng nhập bằng Google"}
         </Btn>
+        <p style={{fontSize: 12, color: "rgba(255,255,255,0.6)", maxWidth: 280}}>
+          Nếu không thấy cửa sổ đăng nhập hiện ra, hãy nhấn nút <b>"Mở trong tab mới"</b> ở góc trên bên phải màn hình.
+        </p>
       </div>
     );
   }
@@ -2332,6 +2535,26 @@ export default function App() {
 
   return (
     <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",background:"linear-gradient(135deg,#4c1d95 0%,#7c3aed 40%,#a78bfa 100%)"}}>
+      {createdGroupParams && (
+        <GroupSuccessModal 
+          group={createdGroupParams.group} 
+          onClose={() => setCreatedGroupParams(null)} 
+        />
+      )}
+      {groupToJoin && profile && (
+        <JoinGroupModal
+          group={groupToJoin}
+          profile={profile}
+          onClose={() => { setGroupToJoin(null); setJoinCode(null); }}
+          onJoined={(g) => {
+            setGroupToJoin(null);
+            setJoinCode(null);
+            setActiveGroup(g);
+            setTab("active");
+            window.history.replaceState({}, document.title, window.location.pathname);
+          }}
+        />
+      )}
       {showOnboarding && (
         <Modal onClose={() => {}}>
           <div style={{ textAlign: "center", padding: "20px 0" }}>
@@ -2352,7 +2575,7 @@ export default function App() {
             <div style={{ marginBottom: 24 }}>
               <div style={{ fontSize: 13, fontWeight: 700, color: "#475569", textAlign: "left", marginBottom: 12 }}>Chọn Avatar</div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "center" }}>
-                {["🐱", "🐶", "🦊", "🐻", "🐼", "🦁", "🐧", "🦄"].map(av => (
+                {["🐱", "🐶", "🦊", "🐻", "🐼", "🦁", "🐧", "🦄", "🐸", "🐰", "🐯", "🐨", "🐷", "🐵", "🐙", "🐢", "🐔", "🐦"].map(av => (
                   <button 
                     key={av}
                     onClick={() => {
@@ -2394,11 +2617,7 @@ export default function App() {
           onClick={() => setTab("settings")}
           style={{cursor: "pointer", transition: "transform 0.2s", ":hover": {transform: "scale(1.05)"}} as any}
         >
-          {profilePic ? (
-            <img src={profilePic} style={{width: 40, height: 40, borderRadius: "50%", objectFit: "cover", border: "2px solid #fff"}} />
-          ) : (
-            <div style={{width: 40, height: 40, borderRadius: "50%", background: "#7c3aed", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 800, fontSize: 14, border: "2px solid #fff"}}>ME</div>
-          )}
+          <Av name={profile?.name || "ME"} size={40} avatar={profilePic || profile?.avatar || ""} style={{ border: "2px solid #fff" }} />
         </div>
         <div style={{textAlign: "center"}}>
           <h1 style={{color:"#fff", fontSize:22, fontWeight:900, letterSpacing:-0.5, margin:0}}>✨ HappyShare</h1>
@@ -2409,32 +2628,10 @@ export default function App() {
 
       <div style={{flex:1,overflowY:"auto",paddingBottom:70}}>
         {tab==="groups"&& (
-          <>
-            {pendingInvites.length > 0 && (
-              <div style={{ padding: "12px 14px 0" }}>
-                <div style={{ fontWeight: 800, fontSize: 13, color: "rgba(255,255,255,0.9)", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
-                  <span>💌 LỜI MỜI MỚI ({pendingInvites.length})</span>
-                  <div style={{ flex: 1, height: 1, background: "rgba(255,255,255,0.2)" }} />
-                </div>
-                {pendingInvites.map(inv => (
-                  <Card key={inv.id} style={{ padding: "12px 14px", marginBottom: 8, background: "rgba(255,255,255,0.95)", borderLeft: "4px solid #db2777" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                      <div style={{ width: 40, height: 40, borderRadius: 12, background: "#fce7f3", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>🧧</div>
-                      <div style={{ flex: 1 }}>
-                        <div style={{ fontSize: 12, color: "#64748b" }}><b>{inv.inviterName}</b> mời bạn tham gia</div>
-                        <div style={{ fontWeight: 800, fontSize: 14, color: "#be185d" }}>Nhóm chi tiêu mới</div>
-                      </div>
-                      <Btn onClick={() => setInviteId(inv.id)} style={{ padding: "6px 12px", fontSize: 12, background: "#db2777" }}>Xem & Tham gia</Btn>
-                    </div>
-                  </Card>
-                ))}
-              </div>
-            )}
-            <GroupsListView groups={groups} friends={friends} onSelectGroup={selectGroup} onCreateGroup={createGroup} onJoinGroup={()=>{}}/>
-          </>
+          <GroupsListView groups={groups} friends={friends} onSelectGroup={selectGroup} onCreateGroup={createGroup}/>
         )}
         {tab==="active"&&activeGroup&&(
-          <GroupView group={groups.find(g=>g.id===activeGroup.id)||activeGroup} friends={friends} onUpdate={updateGroup} onDelete={()=>deleteGroup(activeGroup)} onLeave={()=>leaveGroup(activeGroup)} onBack={() => setTab("groups")}/>
+          <GroupView group={groups.find(g=>g.id===activeGroup.id)||activeGroup} friends={friends} currentUserName={profile?.name || ""} onUpdate={updateGroup} onDelete={()=>deleteGroup(activeGroup)} onLeave={()=>leaveGroup(activeGroup)} onBack={() => setTab("groups")}/>
         )}
         {tab==="friends"&&<FriendsView friends={friends} groups={groups} onAddFriend={addFriend} onRemoveFriend={removeFriend} onPayClick={(g) => selectGroup(g)}/>}
         {tab==="qr" && <ReceiptScannerView groups={groups} onAddExpense={addExpenseToGroup} />}
@@ -2443,17 +2640,13 @@ export default function App() {
             {/* Account Settings */}
             <Card>
               <SecTitle icon="👤" title="Tài khoản" color="#7c3aed"/>
-              <div style={{display:"flex", alignItems:"center", gap:15, marginBottom:15}}>
-                {profilePic ? (
-                  <img src={profilePic} style={{width:64, height:64, borderRadius:"50%", objectFit:"cover", border:"3px solid #7c3aed"}} />
-                ) : (
-                  <div style={{width:64, height:64, borderRadius:"50%", background:"#ede9fe", display:"flex", alignItems:"center", justifyContent:"center", fontSize:24, border:"2px dashed #7c3aed"}}>📷</div>
-                )}
-                <div style={{flex:1}}>
-                  <div style={{fontWeight:700, fontSize:15, marginBottom:4}}>Ảnh đại diện</div>
-                  <input type="file" id="pfp-upload" hidden accept="image/*" onChange={handlePicUpload} />
-                  <label htmlFor="pfp-upload" style={{display:"inline-block", background:"#7c3aed", color:"#fff", padding:"6px 12px", borderRadius:8, fontSize:12, fontWeight:600, cursor:"pointer"}}>Đổi ảnh</label>
+              <div style={{display:"flex", alignItems:"center", gap:12}}>
+                <Av name={profile?.name || "ME"} size={54} avatar={profilePic || profile?.avatar || ""} style={{ border: "2px solid #7c3aed" }} />
+                <div style={{flex:1, overflow:"hidden"}}>
+                  <div style={{fontWeight:800, fontSize:16, color: "#1e1e2e", marginBottom: 2, whiteSpace:"nowrap", textOverflow:"ellipsis", overflow:"hidden"}}>{profile?.name || "Người dùng"}</div>
+                  <div style={{fontWeight:500, fontSize:12, color: "#64748b", whiteSpace:"nowrap", textOverflow:"ellipsis", overflow:"hidden"}}>{profile?.email || ""}</div>
                 </div>
+                <button onClick={() => setShowAvatarModal(true)} style={{background:"#f1f5f9", color:"#334155", padding:"8px 12px", borderRadius:8, fontSize:12, fontWeight:700, border:"none", cursor:"pointer", flexShrink:0}}>📷 Đổi ảnh</button>
               </div>
             </Card>
 
@@ -2461,24 +2654,13 @@ export default function App() {
             <Card>
                <SecTitle icon="⚙️" title="Sở thích & Thông báo" color="#7c3aed"/>
                
-               <div style={{marginBottom:20}}>
-                 <div style={{fontSize:12, fontWeight:700, color:"#64748b", textTransform:"uppercase", letterSpacing:1, marginBottom:10}}>Bảo mật</div>
-                 <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", background:"#f8fafc", padding:"12px 14px", borderRadius:12}}>
-                    <div style={{flex:1}}>
-                       <div style={{fontSize:14, fontWeight:700, color:"#1e293b"}}>Khóa ứng dụng</div>
-                       <div style={{fontSize:11, color:"#64748b"}}>Yêu cầu Passcode khi mở ứng dụng</div>
-                    </div>
-                    <Input 
-                      placeholder="Mã số..." 
-                      type="password" 
-                      value={passcode} 
-                      onChange={(e:any)=>setPasscode(e.target.value)} 
-                      style={{width:100, textAlign:"center", marginBottom:0, padding: "8px"}}
-                    />
+               <div style={{marginBottom:10}}>
+                 <div 
+                   onClick={() => setShowSecurityModal(true)} 
+                   style={{display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", padding: "10px 0"}}
+                 >
+                   <div style={{fontSize:12, fontWeight:700, color:"#64748b", textTransform:"uppercase", letterSpacing:1}}>Bảo mật</div>
                  </div>
-                 {passcode && (
-                   <Btn onClick={() => setIsLocked(true)} color="#ef4444" style={{width:"100%", marginTop: 10, fontSize: 12}}>Khóa ngay bây giờ</Btn>
-                 )}
                </div>
 
                <div>
@@ -2491,25 +2673,149 @@ export default function App() {
                </div>
             </Card>
 
+            {/* Premium */}
+            <Card style={{ background: "linear-gradient(135deg, #fffbeb 0%, #fff 100%)", borderColor: "#fef3c7" }}>
+               <SecTitle icon="👑" title="Premium" color="#d97706"/>
+               <div style={{ display: "flex", flexDirection: "column", gap: 14, marginBottom: 18 }}>
+                 <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                   <div style={{ background: "#fee2e2", width: 34, height: 34, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>🚫</div>
+                   <div style={{ fontSize: 13, fontWeight: 700, color: "#334155" }}>Không có quảng cáo</div>
+                 </div>
+                 <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                   <div style={{ background: "#e0f2fe", width: 34, height: 34, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>☁️</div>
+                   <div style={{ fontSize: 13, fontWeight: 700, color: "#334155" }}>Sao lưu iCloud</div>
+                 </div>
+                 <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                   <div style={{ background: "#dcfce7", width: 34, height: 34, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>📊</div>
+                   <div style={{ fontSize: 13, fontWeight: 700, color: "#334155" }}>Xuất và in dữ liệu Excel</div>
+                 </div>
+                 <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                   <div style={{ background: "#f3e8ff", width: 34, height: 34, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>💳</div>
+                   <div style={{ fontSize: 13, fontWeight: 700, color: "#334155" }}>Thanh toán trong app</div>
+                 </div>
+                 <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                   <div style={{ background: "#ffedd5", width: 34, height: 34, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>🚀</div>
+                   <div style={{ fontSize: 13, fontWeight: 700, color: "#334155" }}>Tính năng sắp ra mắt</div>
+                 </div>
+               </div>
+               <Btn style={{ width: "100%", background: "linear-gradient(135deg, #f59e0b, #d97706)", color: "#fff", display: "flex", justifyContent: "center", alignItems: "center", padding: "14px", border: "none", borderRadius: 12, fontWeight: 800, fontSize: 14, boxShadow: "0 4px 14px rgba(245, 158, 11, 0.3)", letterSpacing: 0.5 }} onClick={() => {}}>
+                 Thanh toán (499.000 đ)
+               </Btn>
+            </Card>
+
+            {showSecurityModal && (
+              <Modal onClose={() => setShowSecurityModal(false)}>
+                <SecTitle icon="🔒" title="Bảo mật" color="#7c3aed" />
+                <div style={{marginBottom: 20}}>
+                  <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", background:"#f8fafc", padding:"12px 14px", borderRadius:12}}>
+                    <div style={{flex:1}}>
+                       <div style={{fontSize:14, fontWeight:700, color:"#1e293b"}}>Khóa ứng dụng</div>
+                       <div style={{fontSize:11, color:"#64748b"}}>Yêu cầu Passcode khi mở ứng dụng</div>
+                    </div>
+                    <Input 
+                      placeholder="Mã số..." 
+                      type="password" 
+                      value={passcode} 
+                      onChange={(e:any)=>setPasscode(e.target.value)} 
+                      style={{width:100, textAlign:"center", marginBottom:0, padding: "8px"}}
+                    />
+                  </div>
+                  {passcode && (
+                    <Btn onClick={() => {setIsLocked(true); setShowSecurityModal(false);}} color="#ef4444" style={{width:"100%", marginTop: 10, fontSize: 12}}>Khóa ngay bây giờ</Btn>
+                  )}
+                </div>
+              </Modal>
+            )}
+
             {showEmailSettings && <EmailSettingsModal prefs={userPrefs} onUpdate={updatePrefs} onClose={() => setShowEmailSettings(false)} />}
 
             {/* Hệ thống */}
             <Card>
                <SecTitle icon="🚪" title="Hệ thống" color="#374151"/>
                <div style={{display:"flex", gap:8}}>
-                 <Btn onClick={logout} color="#374151" style={{flex:1, fontSize:12, padding:"10px"}}>Đăng xuất</Btn>
-                 <Btn 
-                   onClick={() => {
-                     console.log("Delete account button clicked");
-                     deleteAccount();
+                 <Btn onClick={logout} color="#374151" style={{flex:1, fontSize:13, padding:"10px", display: "flex", alignItems: "center", justifyContent: "center", gap: 6}}>
+                   <LogOut size={16} />
+                   Đăng xuất
+                 </Btn>
+                 <button 
+                   onClick={() => setShowDeleteConfirm(true)}
+                   style={{
+                     flex: 1,
+                     background: "#dc2626",
+                     color: "#ffffff",
+                     border: "none",
+                     borderRadius: 12,
+                     padding: "10px",
+                     fontSize: 11,
+                     fontWeight: 800,
+                     cursor: "pointer",
+                     display: "flex",
+                     alignItems: "center",
+                     justifyContent: "center",
+                     gap: 4
                    }}
-                   color="#fecaca" 
-                   style={{flex:1, color:"#991b1b", fontSize:11, border:"1.5px solid #dc2626"}}
                  >
                    🗑️ Xóa Vĩnh Viễn TK
-                 </Btn>
+                 </button>
                </div>
             </Card>
+
+            {showAvatarModal && (
+              <Modal onClose={() => setShowAvatarModal(false)}>
+                <SecTitle icon="🖼️" title="Đổi ảnh đại diện" color="#7c3aed" />
+                <div style={{ marginBottom: 20 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: "#475569", marginBottom: 12 }}>Chọn ảnh có sẵn:</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "center", marginBottom: 20 }}>
+                    {["🐱", "🐶", "🦊", "🐻", "🐼", "🦁", "🐧", "🦄", "🐸", "🐰", "🐯", "🐨", "🐷", "🐵", "🐙", "🐢", "🐔", "🐦"].map(av => (
+                      <button 
+                        key={av}
+                        onClick={async () => {
+                          if (!profile) return;
+                          setLoading(true);
+                          try {
+                            await updateDoc(doc(db, "users", profile.uid), { avatar: av });
+                            const newProfile = { ...profile, avatar: av };
+                            setProfile(newProfile);
+                            setProfilePic(av);
+                            setShowAvatarModal(false);
+                          } catch(err) {
+                            console.error(err);
+                          } finally {
+                            setLoading(false);
+                          }
+                        }}
+                        style={{ width: 44, height: 44, borderRadius: 12, border: "2px solid #f1f5f9", background: "#fff", fontSize: 24, cursor: "pointer", transition: "0.2s" }}
+                      >
+                        {av}
+                      </button>
+                    ))}
+                  </div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: "#475569", marginBottom: 12, textAlign: "center" }}>Hoặc tải ảnh từ thiết bị:</div>
+                  <div style={{ textAlign: "center", marginBottom: 10 }}>
+                    <input type="file" id="pfp-upload" hidden accept="image/*" onChange={(e) => { handlePicUpload(e); setShowAvatarModal(false); }} />
+                    <label htmlFor="pfp-upload" style={{display:"inline-block", background:"#ede9fe", color:"#7c3aed", padding:"12px 20px", borderRadius:12, fontSize:14, fontWeight:700, cursor:"pointer", border: "2px solid #c4b5fd"}}>📸 Chọn ảnh từ máy</label>
+                  </div>
+                </div>
+              </Modal>
+            )}
+
+            {showDeleteConfirm && (
+              <Modal onClose={() => setShowDeleteConfirm(false)}>
+                <div style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: 40, marginBottom: 12 }}>⚠️</div>
+                  <h3 style={{ margin: "0 0 12px 0", color: "#991b1b", fontSize: 18 }}>Cảnh Báo Tối Cao</h3>
+                  <p style={{ margin: "0 0 16px 0", fontSize: 13, color: "#ef4444", fontWeight: 600, lineHeight: 1.5 }}>
+                    Bạn sắp <b>XÓA VĨNH VIỄN</b> tài khoản HappyShare này!<br/><br/>
+                    Toàn bộ hồ sơ, nhóm (do bạn tạo), bạn bè và lịch sử hóa đơn sẽ bị xóa sạch khỏi hệ thống.<br/><br/>
+                    Hành động này KHÔNG THỂ KHÔI PHỤC!
+                  </p>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <Btn onClick={() => setShowDeleteConfirm(false)} color="#94a3b8" style={{ flex: 1 }}>Hủy bỏ</Btn>
+                    <Btn onClick={executeDeleteAccount} color="#dc2626" style={{ flex: 1 }}>Xác nhận Xóa</Btn>
+                  </div>
+                </div>
+              </Modal>
+            )}
           </div>
         )}
       </div>
@@ -2517,7 +2823,7 @@ export default function App() {
       <div style={{position:"fixed",bottom:12,left:12,right:12,background:"rgba(255,255,255,0.9)", backdropFilter:"blur(10px)",borderRadius:20,display:"flex",padding:"8px 4px",boxShadow:"0 8px 32px rgba(124,58,237,0.15)",zIndex:1000, border:"1px solid rgba(255,255,255,0.5)"}}>
         {tabs.map(t=>(
           <button key={t.id} onClick={()=>setTab(t.id)} style={{flex:1,padding:"4px 0",border:"none",background:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:2, position:"relative"}}>
-            <div style={{fontSize:18,color:(tab===t.id || (t.id==="groups" && tab==="active"))?"#7c3aed":"#94a3b8", transform: (tab===t.id || (t.id==="groups" && tab==="active")) ? "translateY(-1px)" : "none", transition: "0.2s"}}>{t.icon}</div>
+            <div style={{fontSize:18, height: 24, display: "flex", alignItems: "center", justifyContent: "center", color:(tab===t.id || (t.id==="groups" && tab==="active"))?"#7c3aed":"#94a3b8", transform: (tab===t.id || (t.id==="groups" && tab==="active")) ? "translateY(-1px)" : "none", transition: "0.2s"}}>{t.icon}</div>
             <span style={{fontSize:9,color:(tab===t.id || (t.id==="groups" && tab==="active"))?"#7c3aed":"#94a3b8", fontWeight:700, letterSpacing:0.3, opacity: (tab===t.id || (t.id==="groups" && tab==="active")) ? 1 : 0.6}}>{t.label}</span>
             {(tab===t.id || (t.id==="groups" && tab==="active")) && <div style={{position:"absolute", bottom:-2, width:4, height:4, borderRadius:"50%", background:"#7c3aed"}} />}
           </button>
