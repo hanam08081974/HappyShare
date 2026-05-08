@@ -946,7 +946,7 @@ function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClos
       alert("📧 Đã gửi lời mời tới " + inviteEmail);
       setInviteEmail("");
     } else {
-      alert("❌ Gửi lời mời thất bại. Kiểm tra SMTP.");
+      alert("❌ Gửi lời mời thất bại. Hãy kiểm tra cấu hình RESEND_API_KEY.");
     }
     setSendingInvite(false);
   };
@@ -2653,7 +2653,7 @@ export default function App() {
         if (success) {
           console.log("Email sent successfully");
         } else {
-          alert("Lời mời đã được lưu, nhưng email không gửi được. Hãy kiểm tra cấu hình SMTP.");
+          alert("Lời mời đã được lưu, nhưng email không gửi được. Hãy kiểm tra cấu hình RESEND_API_KEY.");
         }
       }
     } catch (err) {

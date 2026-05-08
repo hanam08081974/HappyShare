@@ -1,5 +1,5 @@
 import { Handler } from "@netlify/functions";
-import nodemailer from "nodemailer";
+import { Resend } from "resend";
 
 const handler: Handler = async (event, context) => {
   // Only allow POST requests
@@ -21,28 +21,19 @@ const handler: Handler = async (event, context) => {
       };
     }
 
-    const user = process.env.SMTP_USER;
-    const pass = process.env.SMTP_PASS;
-    const host = process.env.SMTP_HOST || "smtp.gmail.com";
-    const port = parseInt(process.env.SMTP_PORT || "587");
-    const secure = process.env.SMTP_SECURE === "true";
+    const apiKey = process.env.RESEND_API_KEY;
 
-    if (!user || !pass) {
+    if (!apiKey) {
       return {
         statusCode: 503,
-        body: JSON.stringify({ error: "Email service not configured on host. Please set SMTP_USER and SMTP_PASS environment variables." }),
+        body: JSON.stringify({ error: "Email service not configured. Please set RESEND_API_KEY environment variable." }),
       };
     }
 
-    const transporter = nodemailer.createTransport({
-      host,
-      port,
-      secure,
-      auth: { user, pass },
-    });
+    const resend = new Resend(apiKey);
 
-    const mailOptions = {
-      from: `"HappyShare" <${user}>`,
+    const { data, error } = await resend.emails.send({
+      from: "HappyShare <onboarding@resend.dev>",
       to: email,
       subject: `[HappyShare] ${inviterName} mời bạn tham gia nhóm ${groupName || "mới"}`,
       html: `
@@ -68,14 +59,20 @@ const handler: Handler = async (event, context) => {
           </div>
         </div>
       `,
-    };
+    });
 
-    await transporter.sendMail(mailOptions);
+    if (error) {
+      console.error("Resend error:", error);
+      return {
+        statusCode: 500,
+        body: JSON.stringify({ error: error.message }),
+      };
+    }
     
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ success: true }),
+      body: JSON.stringify({ success: true, data }),
     };
   } catch (err) {
     console.error("Email sending error:", err);
