@@ -129,6 +129,8 @@ interface Expense {
   payers: Record<string, number>; // Multiple payers: { name: amount }
   splitMode: string; // "equal" | "percent" | "adjust" | "itemized"
   splits: Record<string, number>;
+  participants?: string[]; // New: list of member names who benefit from this expense
+  attachment?: string; // New: optional image attachment
   ts: number;
   category?: string;
   items?: ReceiptItem[]; // For itemized mode
@@ -140,16 +142,23 @@ const getExpenseSplits = (exp: Expense, members: string[]): Record<string, numbe
   const res: Record<string, number> = {};
   const totalAmount = Math.round(exp.amount);
   let distributed = 0;
+  
+  // Use specific participants if provided, otherwise default to all members
+  const activeMembers = exp.participants && exp.participants.length > 0 ? exp.participants : members;
 
   if (exp.splitMode === "equal") {
-    const base = Math.floor(totalAmount / members.length);
-    const rem = totalAmount % members.length;
-    members.forEach((m, i) => {
+    const base = Math.floor(totalAmount / activeMembers.length);
+    const rem = totalAmount % activeMembers.length;
+    // Set 0 for everyone first
+    members.forEach(m => res[m] = 0);
+    // Distribute among active members
+    activeMembers.forEach((m, i) => {
       res[m] = base + (i < rem ? 1 : 0);
     });
   } else if (exp.splitMode === "percent") {
-    members.forEach((m, i) => {
-      if (i === members.length - 1) {
+    members.forEach(m => res[m] = 0);
+    activeMembers.forEach((m, i) => {
+      if (i === activeMembers.length - 1) {
         res[m] = totalAmount - distributed;
       } else {
         res[m] = Math.round((exp.splits[m] || 0) / 100 * totalAmount);
@@ -157,18 +166,19 @@ const getExpenseSplits = (exp: Expense, members: string[]): Record<string, numbe
       }
     });
   } else if (exp.splitMode === "adjust") {
-    const totalAdj = members.reduce((s, m) => s + Math.round(exp.splits[m] || 0), 0);
+    members.forEach(m => res[m] = 0);
+    const totalAdj = activeMembers.reduce((s, m) => s + Math.round(exp.splits[m] || 0), 0);
     const amountToSplit = totalAmount - totalAdj;
-    const base = Math.floor(amountToSplit / members.length);
-    const rem = amountToSplit % members.length;
-    members.forEach((m, i) => {
+    const base = Math.floor(amountToSplit / activeMembers.length);
+    const rem = amountToSplit % activeMembers.length;
+    activeMembers.forEach((m, i) => {
       res[m] = base + (i < rem ? 1 : 0) + Math.round(exp.splits[m] || 0);
     });
   } else if (exp.splitMode === "itemized") {
     members.forEach(m => res[m] = 0);
     exp.items?.forEach(item => {
       const p = Math.round(item.price || 0);
-      const targets = item.assignedTo?.length ? item.assignedTo : members;
+      const targets = item.assignedTo?.length ? item.assignedTo : activeMembers;
       const base = Math.floor(p / targets.length);
       const rem = p % targets.length;
       targets.forEach((m, i) => {
@@ -178,9 +188,9 @@ const getExpenseSplits = (exp: Expense, members: string[]): Record<string, numbe
     const allocated = exp.items?.reduce((s, it) => s + Math.round(it.price || 0), 0) || 0;
     const remaining = totalAmount - allocated;
     if (remaining !== 0) {
-      const base = Math.floor(remaining / members.length);
-      const rem = remaining % members.length;
-      members.forEach((m, i) => {
+      const base = Math.floor(remaining / activeMembers.length);
+      const rem = remaining % activeMembers.length;
+      activeMembers.forEach((m, i) => {
         res[m] = (res[m] || 0) + base + (i < rem ? 1 : 0);
       });
     }
@@ -352,9 +362,10 @@ function Modal({ children, onClose }: { children: React.ReactNode, onClose: () =
 
 function BillDetailModal({ bill, members, onClose }: { bill: Expense, members: string[], onClose: () => void }) {
   if (!bill) return null;
-  const { splitMode, amount, payers, items, desc, ts } = bill;
+  const { splitMode, amount, payers, items, desc, ts, attachment, participants } = bill;
   const splits = getExpenseSplits(bill, members);
   const payerEntries = Object.entries(payers).filter(([_, amt]) => (amt || 0) > 0);
+  const activeParticipants = participants && participants.length > 0 ? participants : members;
 
   return (
     <Modal onClose={onClose}>
@@ -365,6 +376,14 @@ function BillDetailModal({ bill, members, onClose }: { bill: Expense, members: s
           <div style={{ fontSize: 11, color: "#94a3b8" }}>{timeAgo(ts)} · {splitMode === "equal" ? "Chia đều" : splitMode === "percent" ? "Theo %" : splitMode === "itemized" ? "Chia theo món" : "Có điều chỉnh"}</div>
         </div>
       </div>
+
+      {attachment && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Ảnh hóa đơn</div>
+          <img src={attachment} alt="Attachment" style={{ width: "100%", borderRadius: 12, border: "2px solid #f1f5f9" }} referrerPolicy="no-referrer" />
+        </div>
+      )}
+
       <div style={{ background: "linear-gradient(135deg,#7c3aed,#a78bfa)", borderRadius: 12, padding: "12px 16px", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <span style={{ color: "#ddd6fe", fontSize: 12, fontWeight: 600 }}>Tổng hóa đơn</span>
         <span style={{ color: "#fff", fontWeight: 800, fontSize: 20 }}>{fmt(amount)}</span>
@@ -382,13 +401,16 @@ function BillDetailModal({ bill, members, onClose }: { bill: Expense, members: s
       </div>
 
       <div style={{ marginBottom: 14 }}>
-        <div style={{ fontSize: 11, fontWeight: 700, color: "#dc2626", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Phân chia</div>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "#dc2626", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Phân chia ({activeParticipants.length})</div>
         {members.map((m, i) => {
           const share = splits[m] || 0;
           const paid = payers[m] || 0;
           const diff = paid - share;
+          const isParticipant = activeParticipants.includes(m);
+          if (!isParticipant && share <= 0 && paid <= 0) return null;
+          
           return (
-            <div key={i} style={{ display: "flex", alignItems: "center", gap: 9, background: diff >= 0 ? "#f0fdf4" : "#fef2f2", borderRadius: 11, padding: "9px 13px", marginBottom: 5, border: `1.5px solid ${diff >= 0 ? "#bbf7d0" : "#fecaca"}`, opacity: share > 0 || paid > 0 ? 1 : 0.4 }}>
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 9, background: diff >= 0 ? "#f0fdf4" : "#fef2f2", borderRadius: 11, padding: "9px 13px", marginBottom: 5, border: `1.5px solid ${diff >= 0 ? "#bbf7d0" : "#fecaca"}`, opacity: isParticipant || paid > 0 ? 1 : 0.4 }}>
               <Av name={m} size={32} ci={members.indexOf(m)} avatar={bill.memberDetails?.[m]?.avatar} />
               <div style={{ flex: 1 }}>
                 <div style={{ fontWeight: 600, fontSize: 13 }}>{m}</div>
@@ -448,6 +470,8 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
   const [payers, setPayers] = useState<Record<string, number>>({});
   const [mode, setMode] = useState("equal");
   const [splits, setSplits] = useState<Record<string, number>>({});
+  const [participants, setParticipants] = useState<string[]>(members);
+  const [attachment, setAttachment] = useState<string | null>(null);
   
   const [items, setItems] = useState<ReceiptItem[]>([]);
   const [isScanning, setIsScanning] = useState(false);
@@ -477,8 +501,8 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
 
   const updateSplit = (m: string, val: string) => setSplits(s => ({ ...s, [m]: Math.round(parseFloat(val)) || 0 }));
 
-  const totalPct = members.reduce((s: number, m: string) => s + (splits[m] || 0), 0);
-  const totalAdj = members.reduce((s: number, m: string) => s + (splits[m] || 0), 0);
+  const totalPct = participants.reduce((s: number, m: string) => s + (splits[m] || 0), 0);
+  const totalAdj = participants.reduce((s: number, m: string) => s + (splits[m] || 0), 0);
 
   const valid = desc.trim() && amt > 0 && Math.abs(totalPaid - amt) < 1 && (
     mode === "equal" ||
@@ -496,7 +520,9 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
       category,
       payers: { ...payers }, 
       splitMode: mode, 
-      splits: { ...splits }, 
+      splits: { ...splits },
+      participants: participants.length === members.length ? [] : participants,
+      attachment: attachment || undefined,
       ts: Date.now() 
     };
     if (mode === "itemized") expData.items = items;
@@ -504,8 +530,17 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
     onClose();
   };
 
+  const uploadAttachment = (file: File) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (ev) => {
+      setAttachment(ev.target?.result as string);
+    };
+  };
+
   const scanReceipt = async (file: File) => {
     setIsScanning(true);
+    uploadAttachment(file); // Also save as attachment
     try {
       const reader = new FileReader();
       reader.readAsDataURL(file);
@@ -558,6 +593,14 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
     setItems(newItems);
   };
 
+  const toggleParticipant = (m: string) => {
+    if (participants.includes(m)) {
+      setParticipants(participants.filter(p => p !== m));
+    } else {
+      setParticipants([...participants, m]);
+    }
+  };
+
   return (
     <Modal onClose={onClose}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
@@ -572,9 +615,9 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
              <input type="file" accept="image/*" capture="environment" onChange={(e) => { if(e.target.files?.[0]) scanReceipt(e.target.files[0]); }} style={{ display: "none" }} />
           </label>
           <label style={{ display: "flex", alignItems: "center", gap: 6, background: "#f8fafc", border: "1px solid #cbd5e1", color: "#64748b", padding: "6px 10px", borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
-             {isScanning ? <Loader2 size={14} className="animate-spin"/> : <Upload size={14}/>}
-             Ảnh
-             <input type="file" accept="image/*" onChange={(e) => { if(e.target.files?.[0]) scanReceipt(e.target.files[0]); }} style={{ display: "none" }} />
+             <ImagePlus size={14}/>
+             {attachment ? "Đã đính kèm" : "Ảnh"}
+             <input type="file" accept="image/*" onChange={(e) => { if(e.target.files?.[0]) uploadAttachment(e.target.files[0]); }} style={{ display: "none" }} />
           </label>
         </div>
       </div>
@@ -647,6 +690,26 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
         </div>
 
         <div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span>Chi tiền cho</span>
+            <button onClick={() => setParticipants(participants.length === members.length ? [members[0]] : members)} style={{ fontSize: 10, background: "#ede9fe", color: "#7c3aed", border: "none", padding: "2px 8px", borderRadius: 6, fontWeight: 700, cursor: "pointer" }}>
+              {participants.length === members.length ? "Bỏ tất cả" : "Chọn tất cả"}
+            </button>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, background: "#f8fafc", borderRadius: 12, padding: "10px 12px" }}>
+            {members.map((m, i) => {
+              const isP = participants.includes(m);
+              return (
+                <div key={i} onClick={() => toggleParticipant(m)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 10px", borderRadius: 20, border: `1.5px solid ${isP ? "#7c3aed" : "#e2e8f0"}`, background: isP ? "#f5f3ff" : "#fff", cursor: "pointer", transition: "all 0.2s" }}>
+                  <Av name={m} size={20} ci={i} avatar={memberDetails?.[m]?.avatar} />
+                  <span style={{ fontSize: 11, fontWeight: 600, color: isP ? "#7c3aed" : "#64748b" }}>{m}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div>
           <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Kiểu chia</div>
           <div style={{ display:"flex", background: "#f1f5f9", borderRadius:10, padding:3, gap:2 }}>
             {[["equal", "⚖️ Đều"], ["percent", "📊 %"], ["adjust", "🔧 Adj"], ["itemized", "🍔 Món"]].map(([v, l]) => (
@@ -655,13 +718,13 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
           </div>
         </div>
 
-        {mode === "equal" && amt > 0 && (
+        {mode === "equal" && amt > 0 && participants.length > 0 && (
           <div style={{ background: "#f0fdf4", borderRadius: 12, padding: "12px", border: "1.5px solid #bbf7d0" }}>
              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <span style={{ fontSize: 13, fontWeight: 700, color: "#16a34a" }}>⚖️ Chia đều:</span>
-                <span style={{ fontSize: 16, fontWeight: 800, color: "#16a34a" }}>{fmt(amt / members.length)} / người</span>
+                <span style={{ fontSize: 16, fontWeight: 800, color: "#16a34a" }}>{fmt(amt / participants.length)} / người</span>
              </div>
-             <div style={{ fontSize: 10, color: "#16a34a", marginTop: 4, opacity: 0.8 }}>Hệ thống tự động tính cho tất cả {members.length} thành viên</div>
+             <div style={{ fontSize: 10, color: "#16a34a", marginTop: 4, opacity: 0.8 }}>Hệ thống tự động tính cho {participants.length} thành viên tham gia</div>
           </div>
         )}
 
@@ -789,9 +852,12 @@ function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, on
   const [newMemberName, setNewMemberName] = useState("");
   const isLeader = group.leaderUid ? group.leaderUid === auth.currentUser?.uid : group.leader === currentUser;
   const [copiedCode, setCopiedCode] = useState(false);
+  const [showQR, setShowQR] = useState(false);
+
+  const inviteLink = `${window.location.origin}/?joinCode=${group.inviteCode}`;
 
   const copyCode = () => {
-    navigator.clipboard.writeText(`${window.location.origin}/?joinCode=${group.inviteCode}`);
+    navigator.clipboard.writeText(inviteLink);
     setCopiedCode(true);
     setTimeout(() => setCopiedCode(false), 2000);
   };
