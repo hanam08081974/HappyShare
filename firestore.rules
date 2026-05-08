@@ -142,8 +142,5 @@ service cloud.firestore {
         allow delete: if isVerified() && get(/databases/$(database)/documents/groups/$(groupId)).data.leaderUid == request.auth.uid;
       }
     }
-    match /mail/{mailId} {
-      allow create: if isVerified();
-    }
   }
 }

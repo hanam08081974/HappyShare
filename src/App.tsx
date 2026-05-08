@@ -921,6 +921,8 @@ function PayModal({ members, memberAvatars, transactions, onPay, onClose }: { me
 
 function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClose, onUpdate, onLeave, onDelete }: { group: Group, friends: Friend[], currentUser: string, memberAvatars?: Record<string, string>, onClose: () => void, onUpdate: (g: Group) => void, onLeave: () => void, onDelete: () => void }) {
   const [newMemberName, setNewMemberName] = useState("");
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [sendingEmail, setSendingEmail] = useState(false);
   const isLeader = group.leaderUid ? group.leaderUid === auth.currentUser?.uid : group.leader === currentUser;
   const [copiedCode, setCopiedCode] = useState(false);
   const [showQR, setShowQR] = useState(false);
@@ -931,6 +933,34 @@ function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClos
     navigator.clipboard.writeText(inviteLink);
     setCopiedCode(true);
     setTimeout(() => setCopiedCode(false), 2000);
+  };
+
+  const sendInviteEmail = async () => {
+    if (!inviteEmail.trim() || !inviteEmail.includes('@')) {
+      alert("Email không hợp lệ!");
+      return;
+    }
+    setSendingEmail(true);
+    try {
+      const res = await fetch("/api/invite", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: inviteEmail.trim(),
+          inviterName: currentUser,
+          groupName: group.emoji + " " + group.name,
+          inviteLink: inviteLink
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Có lỗi xảy ra");
+      alert("Gửi email thành công!");
+      setInviteEmail("");
+    } catch (err: any) {
+      alert("Lỗi khi gửi email: " + err.message);
+    } finally {
+      setSendingEmail(false);
+    }
   };
 
   const addMember = () => {
@@ -1016,6 +1046,12 @@ function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClos
             </div>
           ))}
           {friends.length === 0 && <div style={{ fontSize: 11, color: "#94a3b8", textAlign: "center", width: "100%" }}>Chưa có bạn bè để thêm.</div>}
+        </div>
+
+        <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>MỜI QUA EMAIL</div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 15 }}>
+          <Input placeholder="Nhập địa chỉ email..." value={inviteEmail} onChange={(e: any) => setInviteEmail(e.target.value)} style={{ fontSize: 13, flex: 1 }} />
+          <Btn onClick={sendInviteEmail} style={{ fontSize: 13 }} disabled={sendingEmail}>{sendingEmail ? "Đang gửi..." : "Gửi Email"}</Btn>
         </div>
 
         <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>THÊM THÀNH VIÊN (Nhập tên)</div>
@@ -2599,13 +2635,8 @@ export default function App() {
     try {
       await addDoc(collection(db, "users", user.uid, "friends"), f);
       if (f.email) {
-        await addDoc(collection(db, "mail"), {
-          to: f.email,
-          message: {
-            subject: `${profile.name} vừa mời bạn kết bạn trên HappyShare!`,
-            html: `<p>Xin chào,</p><p><b>${profile.name}</b> vừa thêm bạn vào danh sách bạn bè trên <b>HappyShare</b>.</p><p>Hãy truy cập ứng dụng để bắt đầu chia sẻ hóa đơn cùng nhau nhé!</p><p><a href="${window.location.origin}" style="display:inline-block;padding:10px 20px;background:#059669;color:#fff;border-radius:8px;text-decoration:none;font-weight:bold;">Mở ứng dụng HappyShare</a></p><hr/><p>HappyShare - Chia sẻ niềm vui, không chỉ là hóa đơn.</p>`
-          }
-        });
+        console.log(`[FRIEND INVITE SIMULATION] To: ${f.email} | Body: ${profile.name} invited you to join HappyShare!`);
+        // In a real app, send actual email here
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, "friends");
