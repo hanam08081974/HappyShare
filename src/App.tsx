@@ -2530,10 +2530,8 @@ export default function App() {
       } else if (err.code === "auth/cancelled-popup-request" || err.code === "auth/popup-closed-by-user") {
         console.log("Login cancelled by user");
       } else {
-        alert("Lỗi đăng nhập: " + (err.message || String(err)) + "\n\nGợi ý: Thử nhấn 'Mở trong tab mới' (Open in New Tab) ở góc phải màn hình.");
-        try {
-          handleFirestoreError(err, OperationType.WRITE, "login");
-        } catch (e) { }
+        alert("Lỗi đăng nhập: " + (err.message || String(err)) + "\n\nNếu bạn đang dùng tên miền mới (như Netlify), hãy chắc chắn đã thêm tên miền đó vào danh sách 'Authorized domains' trong Firebase Console (Authentication > Settings > Authorized domains).");
+        console.error("Auth error details:", err);
       }
     } finally {
       setLoginLoading(false);
@@ -2601,8 +2599,13 @@ export default function App() {
     try {
       await addDoc(collection(db, "users", user.uid, "friends"), f);
       if (f.email) {
-        console.log(`[FRIEND INVITE SIMULATION] To: ${f.email} | Body: ${profile.name} invited you to join HappyShare!`);
-        // In a real app, send actual email here
+        await addDoc(collection(db, "mail"), {
+          to: f.email,
+          message: {
+            subject: `${profile.name} vừa mời bạn kết bạn trên HappyShare!`,
+            html: `<p>Xin chào,</p><p><b>${profile.name}</b> vừa thêm bạn vào danh sách bạn bè trên <b>HappyShare</b>.</p><p>Hãy truy cập ứng dụng để bắt đầu chia sẻ hóa đơn cùng nhau nhé!</p><p><a href="${window.location.origin}" style="display:inline-block;padding:10px 20px;background:#059669;color:#fff;border-radius:8px;text-decoration:none;font-weight:bold;">Mở ứng dụng HappyShare</a></p><hr/><p>HappyShare - Chia sẻ niềm vui, không chỉ là hóa đơn.</p>`
+          }
+        });
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, "friends");
