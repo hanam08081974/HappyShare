@@ -1332,7 +1332,15 @@ function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddEx
       setIsCameraLive(true);
     } catch (err) {
       console.error("Camera error:", err);
-      alert("Không thể mở camera. Vui lòng kiểm tra quyền truy cập. Thử mở ứng dụng trong thẻ mới (Open in new tab).");
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      
+      if ((err instanceof DOMException && err.name === "NotAllowedError") || 
+          errorMessage.includes("Permission") || 
+          errorMessage.includes("NotAllowedError")) {
+        alert("Bạn đã từ chối hoặc hủy quyền truy cập camera. Vui lòng cấp quyền trong cài đặt trình duyệt để tiếp tục.");
+      } else {
+        alert("Không thể mở camera. Vui lòng kiểm tra quyền truy cập. Thử mở ứng dụng trong thẻ mới (Open in new tab).");
+      }
     }
   };
 
@@ -2402,6 +2410,22 @@ export default function App() {
       setActiveGroup(null);
       setTab("groups");
     } catch (err) {
+      let isPermissionError = false;
+      if (err instanceof Error) {
+          try {
+              const info = JSON.parse(err.message);
+              if (info.error && info.error.includes("Missing or insufficient permissions")) {
+                  isPermissionError = true;
+              }
+          } catch(e) {
+              if (err.message.includes("Missing or insufficient permissions")) {
+                  isPermissionError = true;
+              }
+          }
+      }
+      if (isPermissionError) {
+          alert("Bạn không có quyền xóa nhóm này. Chỉ trưởng nhóm mới có quyền xóa.");
+      }
       handleFirestoreError(err, OperationType.DELETE, `groups/${g.id}`);
     }
   };
