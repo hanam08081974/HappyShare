@@ -75,7 +75,7 @@ service cloud.firestore {
     // ─── MATCH BLOCKS ───────────────────────────────────────────
 
     match /users/{userId} {
-      allow get: if isSignedIn() && request.auth.uid == userId;
+      allow get, list: if isSignedIn();
       allow create: if isVerified() && request.auth.uid == userId && isValidUser(incoming());
       allow update: if isVerified() && request.auth.uid == userId && isValidUser(incoming())
                        && incoming().uid == existing().uid // Immutable UID

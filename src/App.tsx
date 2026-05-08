@@ -3,7 +3,7 @@ import React, { useState, useMemo, useEffect, useRef } from "react";
 import { QrCode, Receipt, Upload, Loader2, ImagePlus, Camera, LogOut } from "lucide-react";
 import { initializeApp } from "firebase/app";
 import { getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signOut, User as FirebaseUser, reauthenticateWithPopup } from "firebase/auth";
-import { getFirestore, collection, doc, setDoc, getDoc, getDocs, onSnapshot, query, where, addDoc, updateDoc, deleteDoc, serverTimestamp, getDocFromServer, orderBy, collectionGroup } from "firebase/firestore";
+import { getFirestore, initializeFirestore, collection, doc, setDoc, getDoc, getDocs, onSnapshot, query, where, addDoc, updateDoc, deleteDoc, serverTimestamp, getDocFromServer, orderBy, collectionGroup } from "firebase/firestore";
 import { GoogleGenAI, Type } from "@google/genai";
 import firebaseConfig from "../firebase-applet-config.json";
 import QRCode from "react-qr-code";
@@ -13,7 +13,10 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+export const db = initializeFirestore(app, {
+  experimentalForceLongPolling: true,
+}, firebaseConfig.firestoreDatabaseId);
+
 export const auth = getAuth(app);
 const googleProvider = new GoogleAuthProvider();
 
@@ -75,7 +78,7 @@ async function testConnection() {
 }
 
 // ─── Constants ───────────────────────────────────────────────
-const COLORS = ["#7C3AED","#2563EB","#DB2777","#D97706","#059669","#DC2626","#0891B2","#9333EA","#EA580C","#0D9488"];
+const COLORS = ["#059669","#2563EB","#DB2777","#D97706","#059669","#DC2626","#0891B2","#059669","#EA580C","#0D9488"];
 const EMOJIS = ["🏖️","🍜","🎉","✈️","🏠","🎮","🛒","🍻","🏕️","💼"];
 const fmt = (n: number) => {
   const rounded = Math.round(n);
@@ -116,6 +119,17 @@ interface Friend {
   createdAt: number;
 }
 
+// Helper to clean undefined fields for Firestore
+const clean = (obj: any) => {
+  const newObj = { ...obj };
+  Object.keys(newObj).forEach(key => {
+    if (newObj[key] === undefined) {
+      delete newObj[key];
+    }
+  });
+  return newObj;
+};
+
 interface ReceiptItem {
   name: string;
   price: number;
@@ -138,25 +152,26 @@ interface Expense {
 }
 
 // ─── Utilities ──────────────────────────────────────────────
-const getExpenseSplits = (exp: Expense, members: string[]): Record<string, number> => {
+const getExpenseSplits = (exp: Expense, group: Group): Record<string, number> => {
+  const members = group.members;
   const res: Record<string, number> = {};
   const totalAmount = Math.round(exp.amount);
   let distributed = 0;
   
-  // Use specific participants if provided, otherwise default to all members
-  const activeMembers = exp.participants && exp.participants.length > 0 ? exp.participants : members;
+  // Use specific participants if provided, otherwise deduce from memberDetails, fallback to members joined before expense
+  const activeMembers = exp.participants && exp.participants.length > 0 ? exp.participants : (exp.memberDetails && Object.keys(exp.memberDetails).length > 0 ? Object.keys(exp.memberDetails) : members.filter(m => !(group.memberJoinedAt?.[m]) || group.memberJoinedAt[m] <= exp.ts + 300000));
+
+  members.forEach(m => res[m] = 0);
+  activeMembers.forEach(m => res[m] = 0);
 
   if (exp.splitMode === "equal") {
     const base = Math.floor(totalAmount / activeMembers.length);
     const rem = totalAmount % activeMembers.length;
-    // Set 0 for everyone first
-    members.forEach(m => res[m] = 0);
     // Distribute among active members
     activeMembers.forEach((m, i) => {
       res[m] = base + (i < rem ? 1 : 0);
     });
   } else if (exp.splitMode === "percent") {
-    members.forEach(m => res[m] = 0);
     activeMembers.forEach((m, i) => {
       if (i === activeMembers.length - 1) {
         res[m] = totalAmount - distributed;
@@ -166,7 +181,6 @@ const getExpenseSplits = (exp: Expense, members: string[]): Record<string, numbe
       }
     });
   } else if (exp.splitMode === "adjust") {
-    members.forEach(m => res[m] = 0);
     const totalAdj = activeMembers.reduce((s, m) => s + Math.round(exp.splits[m] || 0), 0);
     const amountToSplit = totalAmount - totalAdj;
     const base = Math.floor(amountToSplit / activeMembers.length);
@@ -175,7 +189,6 @@ const getExpenseSplits = (exp: Expense, members: string[]): Record<string, numbe
       res[m] = base + (i < rem ? 1 : 0) + Math.round(exp.splits[m] || 0);
     });
   } else if (exp.splitMode === "itemized") {
-    members.forEach(m => res[m] = 0);
     exp.items?.forEach(item => {
       const p = Math.round(item.price || 0);
       const targets = item.assignedTo?.length ? item.assignedTo : activeMembers;
@@ -210,7 +223,7 @@ const computeGroupBalances = (group: Group) => {
   members.forEach(m => adj[m] = 0);
 
   expenses.forEach(e => {
-    const splits = getExpenseSplits(e, members);
+    const splits = getExpenseSplits(e, group);
     // Add amounts paid by this member
     Object.entries(e.payers).forEach(([name, amt]) => {
       if (adj[name] !== undefined) adj[name] += Math.round(amt as number);
@@ -275,6 +288,7 @@ interface Group {
   feed?: FeedItem[];
   inviteCode: string;
   dueDate: string;
+  memberJoinedAt?: Record<string, number>;
 }
 
 // ─── Tiny Components ─────────────────────────────────────────
@@ -286,15 +300,16 @@ function Av({ name, size=36, ci=0, avatar, style={} }: { name: string, size?: nu
     return <div style={{width:size,height:size,borderRadius:"50%",background:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontSize:size*0.6,flexShrink:0,boxShadow:"0 2px 8px rgba(0,0,0,0.05)",...style}}>{avatar}</div>;
   }
   const ini = name.trim().split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2);
-  return <div style={{width:size,height:size,borderRadius:"50%",background:COLORS[ci%COLORS.length],display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,fontSize:size*.38,flexShrink:0,...style}}>{ini||"?"}</div>;
+  const hash = name.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
+  return <div style={{width:size,height:size,borderRadius:"50%",background:COLORS[hash%COLORS.length],display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,fontSize:size*.38,flexShrink:0,...style}}>{ini||"?"}</div>;
 }
 function Card({ children, style={}, onClick }: { children: React.ReactNode, style?: any, onClick?: () => void, key?: any }) {
-  return <div onClick={onClick} style={{background:"#fff",borderRadius:16,boxShadow:"0 4px 24px rgba(120,60,220,.10)",padding:"16px",marginBottom:10,...style,cursor:onClick?"pointer":"default"}}>{children}</div>;
+  return <div onClick={onClick} style={{background:"#fff",borderRadius:16,boxShadow:"0 4px 24px rgba(11,86,94,.12)",padding:"16px",marginBottom:10,...style,cursor:onClick?"pointer":"default"}}>{children}</div>;
 }
-function SecTitle({ icon, title, color, right, textColor="#3b1e6e" }: { icon: string, title: string, color: string, right?: React.ReactNode, textColor?: string }) {
+function SecTitle({ icon, title, color, right, textColor="#0b565e" }: { icon: string, title: string, color: string, right?: React.ReactNode, textColor?: string }) {
   return <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:12}}><div style={{width:30,height:30,borderRadius:9,background:color+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15}}>{icon}</div><span style={{fontWeight:700,fontSize:14,color:textColor,flex:1}}>{title}</span>{right}</div>;
 }
-function Btn({ children, onClick, color="#7c3aed", disabled=false, style={} }: { children: React.ReactNode, onClick: () => void, color?: string, disabled?: boolean, style?: any }) {
+function Btn({ children, onClick, color="#059669", disabled=false, style={} }: { children: React.ReactNode, onClick: () => void, color?: string, disabled?: boolean, style?: any }) {
   return <button onClick={onClick} disabled={disabled} style={{background:disabled?"#e2e8f0":color,color:disabled?"#94a3b8":"#fff",border:"none",borderRadius:11,padding:"11px 16px",fontWeight:700,fontSize:13,cursor:disabled?"not-allowed":"pointer",...style}}>{children}</button>;
 }
 function Input({ style={}, ...p }: any) {
@@ -338,8 +353,8 @@ function JoinGroupModal({ group, profile, onClose, onJoined }: { group: Group, p
     <Modal onClose={onClose}>
       <div style={{ textAlign: "center", padding: "10px 0 20px" }}>
         <div style={{ fontSize: 50, marginBottom: 10 }}>{group.emoji}</div>
-        <div style={{ fontSize: 20, fontWeight: 800, color: "#1e1e2e", marginBottom: 6 }}>{group.name}</div>
-        <div style={{ fontSize: 13, color: "#64748b", marginBottom: 20 }}>Mời bạn tham gia nhóm chi tiêu chung.</div>
+        <div style={{ fontSize: 20, fontWeight: 800, color: "#0b565e", marginBottom: 6 }}>{group.name}</div>
+        <div style={{ fontSize: 13, color: "#2d666d", marginBottom: 20 }}>Mời bạn tham gia nhóm chi tiêu chung.</div>
         <Btn onClick={handleJoin} disabled={joining} style={{ width: "100%", padding: 14 }}>
           {joining ? "Đang xử lý..." : "Tham gia ngay 🚀"}
         </Btn>
@@ -360,42 +375,43 @@ function Modal({ children, onClose }: { children: React.ReactNode, onClose: () =
   );
 }
 
-function BillDetailModal({ bill, members, onClose }: { bill: Expense, members: string[], onClose: () => void }) {
+function BillDetailModal({ bill, group, memberAvatars, onClose }: { bill: Expense, group: Group, memberAvatars?: Record<string, string>, onClose: () => void }) {
   if (!bill) return null;
+  const members = group.members;
   const { splitMode, amount, payers, items, desc, ts, attachment, participants } = bill;
-  const splits = getExpenseSplits(bill, members);
+  const splits = getExpenseSplits(bill, group);
   const payerEntries = Object.entries(payers).filter(([_, amt]) => (amt || 0) > 0);
-  const activeParticipants = participants && participants.length > 0 ? participants : members;
+  const activeParticipants = participants && participants.length > 0 ? participants : (bill.memberDetails && Object.keys(bill.memberDetails).length > 0 ? Object.keys(bill.memberDetails) : members.filter(m => !(group.memberJoinedAt?.[m]) || group.memberJoinedAt[m] <= ts + 300000));
 
   return (
     <Modal onClose={onClose}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
-        <div style={{ width: 46, height: 46, borderRadius: 13, background: "#ede9fe", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>🧾</div>
+        <div style={{ width: 46, height: 46, borderRadius: 13, background: "rgba(11,86,94,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>🧾</div>
         <div>
-          <div style={{ fontWeight: 800, fontSize: 16 }}>{desc}</div>
-          <div style={{ fontSize: 11, color: "#94a3b8" }}>{timeAgo(ts)} · {splitMode === "equal" ? "Chia đều" : splitMode === "percent" ? "Theo %" : splitMode === "itemized" ? "Chia theo món" : "Có điều chỉnh"}</div>
+          <div style={{ fontWeight: 800, fontSize: 16, color: "#0b565e" }}>{desc}</div>
+          <div style={{ fontSize: 11, color: "#2d666d" }}>{timeAgo(ts)} · {splitMode === "equal" ? "Chia đều" : splitMode === "percent" ? "Theo %" : splitMode === "itemized" ? "Chia theo món" : "Có điều chỉnh"}</div>
         </div>
       </div>
 
       {attachment && (
         <div style={{ marginBottom: 16 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Ảnh hóa đơn</div>
-          <img src={attachment} alt="Attachment" style={{ width: "100%", borderRadius: 12, border: "2px solid #f1f5f9" }} referrerPolicy="no-referrer" />
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#2d666d", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Ảnh hóa đơn</div>
+          <img src={attachment} alt="Attachment" style={{ width: "100%", borderRadius: 12, border: "2px solid rgba(11,86,94,0.2)" }} referrerPolicy="no-referrer" />
         </div>
       )}
 
-      <div style={{ background: "linear-gradient(135deg,#7c3aed,#a78bfa)", borderRadius: 12, padding: "12px 16px", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <span style={{ color: "#ddd6fe", fontSize: 12, fontWeight: 600 }}>Tổng hóa đơn</span>
-        <span style={{ color: "#fff", fontWeight: 800, fontSize: 20 }}>{fmt(amount)}</span>
+      <div style={{ background: "linear-gradient(135deg, #82edc0, #7be0dc)", borderRadius: 12, padding: "12px 16px", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ color: "#0b565e", fontSize: 12, fontWeight: 600 }}>Tổng hóa đơn</span>
+        <span style={{ color: "#0b565e", fontWeight: 800, fontSize: 20 }}>{fmt(amount)}</span>
       </div>
       
       <div style={{ marginBottom: 12 }}>
-        <div style={{ fontSize: 11, fontWeight: 700, color: "#7c3aed", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Đã thanh toán ({payerEntries.length})</div>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "#059669", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Đã thanh toán ({payerEntries.length})</div>
         {payerEntries.map(([name, amt], i) => (
-          <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: "#f5f3ff", borderRadius: 11, padding: "9px 13px", marginBottom: 5 }}>
-            <Av name={name} size={34} ci={members.indexOf(name)} avatar={bill.memberDetails?.[name]?.avatar} />
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: "#f0fdf4", borderRadius: 11, padding: "9px 13px", marginBottom: 5 }}>
+            <Av name={name} size={34} ci={members.indexOf(name)} avatar={memberAvatars?.[name] || bill.memberDetails?.[name]?.avatar} />
             <div style={{ flex: 1 }}><div style={{ fontWeight: 700, fontSize: 13 }}>{name}</div></div>
-            <span style={{ fontWeight: 800, fontSize: 14, color: "#7c3aed" }}>{fmt(amt)}</span>
+            <span style={{ fontWeight: 800, fontSize: 14, color: "#059669" }}>{fmt(amt)}</span>
           </div>
         ))}
       </div>
@@ -411,13 +427,13 @@ function BillDetailModal({ bill, members, onClose }: { bill: Expense, members: s
           
           return (
             <div key={i} style={{ display: "flex", alignItems: "center", gap: 9, background: diff >= 0 ? "#f0fdf4" : "#fef2f2", borderRadius: 11, padding: "9px 13px", marginBottom: 5, border: `1.5px solid ${diff >= 0 ? "#bbf7d0" : "#fecaca"}`, opacity: isParticipant || paid > 0 ? 1 : 0.4 }}>
-              <Av name={m} size={32} ci={members.indexOf(m)} avatar={bill.memberDetails?.[m]?.avatar} />
+              <Av name={m} size={32} ci={members.indexOf(m)} avatar={memberAvatars?.[m] || bill.memberDetails?.[m]?.avatar} />
               <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 600, fontSize: 13 }}>{m}</div>
+                <div style={{ fontWeight: 600, fontSize: 13, color: "#0b565e" }}>{m}</div>
                 {Math.abs(Math.round(diff)) >= 1 && (
                   <div style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>
                     <span style={{ fontWeight: 900, color: diff >= 0 ? "#16a34a" : "#dc2626", background: diff >= 0 ? "#dcfce7" : "#fee2e2", padding: "1px 4px", borderRadius: 4, fontSize: 9 }}>{diff >= 0 ? "💰 ĐÃ DƯ" : "🔴 CÒN NỢ"}</span>
-                    <span style={{ color: "#64748b" }}>{fmt(Math.abs(diff))}</span>
+                    <span style={{ color: "#2d666d" }}>{fmt(Math.abs(diff))}</span>
                   </div>
                 )}
               </div>
@@ -429,15 +445,15 @@ function BillDetailModal({ bill, members, onClose }: { bill: Expense, members: s
 
       {splitMode === "itemized" && items && items.length > 0 && (
         <div style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "#475569", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Chi tiết món</div>
-          <div style={{ background: "#f8fafc", borderRadius: 12, padding: "10px 12px", border: "1px solid #e2e8f0" }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#0b565e", textTransform: "uppercase", letterSpacing: 1, marginBottom: 7 }}>Chi tiết món</div>
+          <div style={{ background: "rgba(255,255,255,0.4)", borderRadius: 12, padding: "10px 12px", border: "1px solid rgba(11,86,94,0.1)" }}>
             {items.map((it, idx) => (
-              <div key={idx} style={{ padding: "8px 0", borderBottom: idx === items.length - 1 ? "none" : "1px solid #e2e8f0" }}>
+              <div key={idx} style={{ padding: "8px 0", borderBottom: idx === items.length - 1 ? "none" : "1px solid rgba(11,86,94,0.1)" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontWeight: 600 }}>
-                  <span style={{ fontSize: 13, color: "#1e293b", flex: 1, paddingRight: 10 }}>{it.name}</span>
-                  <span style={{ color: "#ec4899", fontSize: 13, whiteSpace: "nowrap" }}>{fmt(it.price || 0)}</span>
+                  <span style={{ fontSize: 13, color: "#0b565e", flex: 1, paddingRight: 10 }}>{it.name}</span>
+                  <span style={{ color: "#0b565e", fontSize: 13, whiteSpace: "nowrap" }}>{fmt(it.price || 0)}</span>
                 </div>
-                <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
+                <div style={{ fontSize: 11, color: "#2d666d", marginTop: 4 }}>
                   {it.assignedTo.length > 0 ? it.assignedTo.join(", ") : "Chia đều cả nhóm"}
                 </div>
               </div>
@@ -463,7 +479,7 @@ const EXPENSE_CATEGORIES = [
   { id: "other", label: "Khác", icon: "📦", color: "#64748b" }
 ];
 
-function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: string[], memberDetails?: any, onAdd: (e: Expense) => void, onClose: () => void }) {
+function AddExpenseModal({ members, memberAvatars, onAdd, onClose }: { members: string[], memberAvatars?: Record<string, string>, onAdd: (e: Expense) => void, onClose: () => void }) {
   const [desc, setDesc] = useState("");
   const [amount, setAmount] = useState("");
   const [category, setCategory] = useState("food");
@@ -521,7 +537,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
       payers: { ...payers }, 
       splitMode: mode, 
       splits: { ...splits },
-      participants: participants.length === members.length ? [] : participants,
+      participants: participants,
       attachment: attachment || undefined,
       ts: Date.now() 
     };
@@ -609,7 +625,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
           <div style={{ fontWeight: 800, fontSize: 16, color: "#1e1e2e" }}>Thêm Khoản Chi</div>
         </div>
         <div style={{ display: "flex", gap: 5 }}>
-          <label style={{ display: "flex", alignItems: "center", gap: 6, background: "linear-gradient(135deg,#ec4899,#f43f5e)", color: "#fff", padding: "6px 10px", borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: "pointer", boxShadow: "0 2px 5px rgba(236,72,153,0.3)" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, background: "linear-gradient(135deg, #0b565e, #147f87)", color: "#fff", padding: "6px 10px", borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: "pointer", boxShadow: "0 2px 5px rgba(11,86,94,0.3)" }}>
            {isScanning ? <Loader2 size={18} className="animate-spin"/> : <Camera size={18}/>}
              {isScanning ? "Đang quét..." : "Chụp AI"}
              <input type="file" accept="image/*" capture="environment" onChange={(e) => { if(e.target.files?.[0]) scanReceipt(e.target.files[0]); }} style={{ display: "none" }} />
@@ -617,10 +633,23 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
           <label style={{ display: "flex", alignItems: "center", gap: 6, background: "#f8fafc", border: "1px solid #cbd5e1", color: "#64748b", padding: "6px 10px", borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
              <ImagePlus size={14}/>
              {attachment ? "Đã đính kèm" : "Ảnh"}
-             <input type="file" accept="image/*" onChange={(e) => { if(e.target.files?.[0]) uploadAttachment(e.target.files[0]); }} style={{ display: "none" }} />
+             <input type="file" accept="image/*" onChange={(e) => { 
+               const file = e.target.files?.[0];
+               if (file) {
+                 if (file.size > 500 * 1024) { alert("🚨 Ảnh quá lớn (tối đa 500KB)"); return; }
+                 uploadAttachment(file); 
+               }
+             }} style={{ display: "none" }} />
           </label>
         </div>
       </div>
+
+      {attachment && (
+        <div style={{ position: "relative", marginBottom: 12, textAlign: "center" }}>
+          <img src={attachment} style={{ maxHeight: 120, borderRadius: 12, boxShadow: "0 4px 12px rgba(0,0,0,0.1)", border: "2px solid #f1f5f9" }} />
+          <button onClick={() => setAttachment(null)} style={{ position: "absolute", top: -8, right: "calc(50% - 70px)", background: "#ef4444", color: "#fff", border: "none", width: 24, height: 24, borderRadius: "50%", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, boxShadow: "0 2px 4px rgba(0,0,0,0.2)" }}>×</button>
+        </div>
+      )}
 
       <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
         <Input placeholder="Mô tả" value={desc} onChange={(e: any) => setDesc(e.target.value)} />
@@ -653,7 +682,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
           <div style={{ display: "flex", gap: 6, marginBottom: 10, overflowX: "auto", paddingBottom: 4 }}>
             <button 
               onClick={() => setPayers({ [members[0]]: amt })} 
-              style={{ background: payers[members[0]] === amt ? "#7c3aed" : "#f1f5f9", color: payers[members[0]] === amt ? "#fff" : "#64748b", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}
+              style={{ background: payers[members[0]] === amt ? "#059669" : "#f1f5f9", color: payers[members[0]] === amt ? "#fff" : "#64748b", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}
             >
               🙋 Bạn trả hết
             </button>
@@ -664,7 +693,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
                 members.forEach(m => p[m] = share);
                 setPayers(p);
               }} 
-              style={{ background: totalPaid === amt && Object.keys(payers).length > 1 ? "#7c3aed" : "#f1f5f9", color: totalPaid === amt && Object.keys(payers).length > 1 ? "#fff" : "#64748b", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}
+              style={{ background: totalPaid === amt && Object.keys(payers).length > 1 ? "#059669" : "#f1f5f9", color: totalPaid === amt && Object.keys(payers).length > 1 ? "#fff" : "#64748b", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}
             >
               🤝 Cả nhóm cùng trả
             </button>
@@ -676,7 +705,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
               const isFull = Math.abs((payers[m] || 0) - amt) < 0.1 && amt > 0;
               return (
                 <div key={i} onClick={() => setPayers({ [m]: amt })} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, cursor: "pointer", padding: "4px 8px", borderRadius: 10, background: isSelected ? "#fff" : "transparent", boxShadow: isSelected ? "0 2px 8px rgba(0,0,0,0.05)" : "none", transition: "all 0.2s" }}>
-                  <Av name={m} size={30} ci={i} avatar={memberDetails?.[m]?.avatar} />
+                  <Av name={m} size={30} ci={i} avatar={memberAvatars?.[m]} />
                   <span style={{ fontSize: 13, fontWeight: isSelected ? 700 : 600, color: isSelected ? "#1e293b" : "#64748b", flex: 1 }}>{m}</span>
                   {isSelected && (
                     <div style={{ background: isFull ? "#f0fdf4" : "#f1f5f9", color: isFull ? "#16a34a" : "#64748b", fontSize: 10, fontWeight: 800, padding: "3px 8px", borderRadius: 6 }}>
@@ -692,7 +721,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
         <div>
           <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <span>Chi tiền cho</span>
-            <button onClick={() => setParticipants(participants.length === members.length ? [members[0]] : members)} style={{ fontSize: 10, background: "#ede9fe", color: "#7c3aed", border: "none", padding: "2px 8px", borderRadius: 6, fontWeight: 700, cursor: "pointer" }}>
+            <button onClick={() => setParticipants(participants.length === members.length ? [members[0]] : members)} style={{ fontSize: 10, background: "#ecfdf5", color: "#059669", border: "none", padding: "2px 8px", borderRadius: 6, fontWeight: 700, cursor: "pointer" }}>
               {participants.length === members.length ? "Bỏ tất cả" : "Chọn tất cả"}
             </button>
           </div>
@@ -700,9 +729,9 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
             {members.map((m, i) => {
               const isP = participants.includes(m);
               return (
-                <div key={i} onClick={() => toggleParticipant(m)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 10px", borderRadius: 20, border: `1.5px solid ${isP ? "#7c3aed" : "#e2e8f0"}`, background: isP ? "#f5f3ff" : "#fff", cursor: "pointer", transition: "all 0.2s" }}>
-                  <Av name={m} size={20} ci={i} avatar={memberDetails?.[m]?.avatar} />
-                  <span style={{ fontSize: 11, fontWeight: 600, color: isP ? "#7c3aed" : "#64748b" }}>{m}</span>
+                <div key={i} onClick={() => toggleParticipant(m)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 10px", borderRadius: 20, border: `1.5px solid ${isP ? "#059669" : "#e2e8f0"}`, background: isP ? "#f0fdf4" : "#fff", cursor: "pointer", transition: "all 0.2s" }}>
+                  <Av name={m} size={20} ci={i} avatar={memberAvatars?.[m]} />
+                  <span style={{ fontSize: 11, fontWeight: 600, color: isP ? "#059669" : "#64748b" }}>{m}</span>
                 </div>
               );
             })}
@@ -713,7 +742,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
           <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Kiểu chia</div>
           <div style={{ display:"flex", background: "#f1f5f9", borderRadius:10, padding:3, gap:2 }}>
             {[["equal", "⚖️ Đều"], ["percent", "📊 %"], ["adjust", "🔧 Adj"], ["itemized", "🍔 Món"]].map(([v, l]) => (
-              <button key={v} onClick={() => setMode(v)} style={{ flex: 1, padding: "7px 4px", border: "none", borderRadius: 8, background: mode === v ? "#7c3aed" : "transparent", color: mode === v ? "#fff" : "#64748b", fontWeight: 700, fontSize: 11, cursor: "pointer", whiteSpace: "nowrap" }}>{l}</button>
+              <button key={v} onClick={() => setMode(v)} style={{ flex: 1, padding: "7px 4px", border: "none", borderRadius: 8, background: mode === v ? "#059669" : "transparent", color: mode === v ? "#fff" : "#64748b", fontWeight: 700, fontSize: 11, cursor: "pointer", whiteSpace: "nowrap" }}>{l}</button>
             ))}
           </div>
         </div>
@@ -759,7 +788,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
                 <div style={{ fontSize: 11, color: Math.abs(totalPct - 100) < 0.01 ? "#059669" : "#dc2626", fontWeight: 700, marginBottom: 8 }}>Tổng: {totalPct}%</div>
                 {members.map((m, i) => (
                   <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                    <Av name={m} size={26} ci={i} avatar={memberDetails?.[m]?.avatar}/><span style={{ flex: 1, fontSize: 12, fontWeight: 600 }}>{m}</span>
+                    <Av name={m} size={26} ci={i} avatar={memberAvatars?.[m]}/><span style={{ flex: 1, fontSize: 12, fontWeight: 600 }}>{m}</span>
                     <input type="number" value={splits[m] || ""} onChange={e => updateSplit(m, e.target.value)} placeholder="0" style={{ width: 60, border: "2px solid #e2e8f0", borderRadius: 8, padding: "5px 7px", fontSize: 13, outline: "none", textAlign: "right" }} />
                     <span style={{ fontSize: 11, color: "#94a3b8", minWidth: 60 }}>{fmt((splits[m] || 0) / 100 * amt)}</span>
                   </div>
@@ -771,7 +800,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
                 <div style={{ fontSize: 11, color: Math.abs(totalAdj) < 1 ? "#059669" : "#dc2626", fontWeight: 700, marginBottom: 8 }}>Bù: {fmt(totalAdj)}</div>
                 {members.map((m, i) => (
                   <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                    <Av name={m} size={26} ci={i} avatar={memberDetails?.[m]?.avatar}/><span style={{ flex: 1, fontSize: 12, fontWeight: 600 }}>{m}</span>
+                    <Av name={m} size={26} ci={i} avatar={memberAvatars?.[m]}/><span style={{ flex: 1, fontSize: 12, fontWeight: 600 }}>{m}</span>
                     <input 
                       type="text" 
                       inputMode="numeric"
@@ -793,7 +822,7 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
   );
 }
 
-function PayModal({ members, memberDetails, transactions, onPay, onClose }: { members: string[], memberDetails?: any, transactions: any[], onPay: (p: Payment) => void, onClose: () => void }) {
+function PayModal({ members, memberAvatars, transactions, onPay, onClose }: { members: string[], memberAvatars?: Record<string, string>, transactions: any[], onPay: (p: Payment) => void, onClose: () => void }) {
   const [from,setFrom]=useState(transactions[0]?.from||members[0]||"");
   const [to,setTo]=useState(transactions[0]?.to||"");
   const [amount,setAmount]=useState(transactions[0]?Math.round(transactions[0].amount):"");
@@ -852,8 +881,8 @@ function PayModal({ members, memberDetails, transactions, onPay, onClose }: { me
         <div style={{fontSize:11,fontWeight:700,color:"#64748b",textTransform:"uppercase",marginBottom:6}}>Người trả</div>
         <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
           {members.map((m,i)=>(
-            <button key={i} onClick={()=>{setFrom(m);const s=transactions.find(t=>t.from===m);if(s){setTo(s.to);setAmount(Math.round(s.amount).toString());}}} style={{display:"flex",alignItems:"center",gap:5,padding:"5px 10px 5px 5px",borderRadius:18,border:`2px solid ${from===m?"#7c3aed":"#e2e8f0"}`,background:from===m?"#f5f3ff":"#fff",cursor:"pointer"}}>
-              <Av name={m} size={22} ci={i} avatar={memberDetails?.[m]?.avatar}/><span style={{fontSize:12,fontWeight:600,color:from===m?"#7c3aed":"#374151"}}>{m}</span>
+            <button key={i} onClick={()=>{setFrom(m);const s=transactions.find(t=>t.from===m);if(s){setTo(s.to);setAmount(Math.round(s.amount).toString());}}} style={{display:"flex",alignItems:"center",gap:5,padding:"5px 10px 5px 5px",borderRadius:18,border:`2px solid ${from===m?"#059669":"#e2e8f0"}`,background:from===m?"#f0fdf4":"#fff",cursor:"pointer"}}>
+              <Av name={m} size={22} ci={i} avatar={memberAvatars?.[m]}/><span style={{fontSize:12,fontWeight:600,color:from===m?"#059669":"#374151"}}>{m}</span>
             </button>
           ))}
         </div>
@@ -863,7 +892,7 @@ function PayModal({ members, memberDetails, transactions, onPay, onClose }: { me
         <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
           {members.filter(m=>m!==from).map((m,i)=>(
             <button key={i} onClick={()=>{setTo(m);const s=transactions.find(t=>t.from===from&&t.to===m);if(s)setAmount(Math.round(s.amount).toString());}} style={{display:"flex",alignItems:"center",gap:5,padding:"5px 10px 5px 5px",borderRadius:18,border:`2px solid ${to===m?"#059669":"#e2e8f0"}`,background:to===m?"#f0fdf4":"#fff",cursor:"pointer"}}>
-              <Av name={m} size={22} ci={members.indexOf(m)} avatar={memberDetails?.[m]?.avatar}/><span style={{fontSize:12,fontWeight:600,color:to===m?"#059669":"#374151"}}>{m}</span>
+              <Av name={m} size={22} ci={members.indexOf(m)} avatar={memberAvatars?.[m]}/><span style={{fontSize:12,fontWeight:600,color:to===m?"#059669":"#374151"}}>{m}</span>
             </button>
           ))}
         </div>
@@ -881,8 +910,8 @@ function PayModal({ members, memberDetails, transactions, onPay, onClose }: { me
       
       <div style={{fontSize:11,fontWeight:700,color:"#64748b",textTransform:"uppercase",marginBottom:6}}>Phương thức thanh toán</div>
       <div style={{display:"flex",background:"#f1f5f9",borderRadius:10,padding:3,gap:2,marginBottom:16}}>
-        <div onClick={() => setPaymentMethod('cash')} style={{flex:1,padding:"7px 4px",borderRadius:8,background:paymentMethod==='cash'?"#7c3aed":"transparent",color:paymentMethod==='cash'?"#fff":"#64748b",textAlign:"center",fontWeight:700,fontSize:12,cursor:"pointer"}}>💵 Tiền mặt</div>
-        <div onClick={() => setPaymentMethod('ewallet')} style={{flex:1,padding:"7px 4px",borderRadius:8,background:paymentMethod==='ewallet'?"#7c3aed":"transparent",color:paymentMethod==='ewallet'?"#fff":"#64748b",textAlign:"center",fontWeight:700,fontSize:12,cursor:"pointer"}}>📱 Ví điện tử</div>
+        <div onClick={() => setPaymentMethod('cash')} style={{flex:1,padding:"7px 4px",borderRadius:8,background:paymentMethod==='cash'?"#059669":"transparent",color:paymentMethod==='cash'?"#fff":"#64748b",textAlign:"center",fontWeight:700,fontSize:12,cursor:"pointer"}}>💵 Tiền mặt</div>
+        <div onClick={() => setPaymentMethod('ewallet')} style={{flex:1,padding:"7px 4px",borderRadius:8,background:paymentMethod==='ewallet'?"#059669":"transparent",color:paymentMethod==='ewallet'?"#fff":"#64748b",textAlign:"center",fontWeight:700,fontSize:12,cursor:"pointer"}}>📱 Ví điện tử</div>
       </div>
 
       <Btn onClick={() => handlePay()} color="linear-gradient(135deg,#059669,#34d399)" style={{width:"100%"}}>✅ Xác nhận thanh toán</Btn>
@@ -890,7 +919,7 @@ function PayModal({ members, memberDetails, transactions, onPay, onClose }: { me
   );
 }
 
-function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, onLeave, onDelete }: { group: Group, friends: Friend[], currentUser: string, onClose: () => void, onUpdate: (g: Group) => void, onLeave: () => void, onDelete: () => void }) {
+function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClose, onUpdate, onLeave, onDelete }: { group: Group, friends: Friend[], currentUser: string, memberAvatars?: Record<string, string>, onClose: () => void, onUpdate: (g: Group) => void, onLeave: () => void, onDelete: () => void }) {
   const [newMemberName, setNewMemberName] = useState("");
   const isLeader = group.leaderUid ? group.leaderUid === auth.currentUser?.uid : group.leader === currentUser;
   const [copiedCode, setCopiedCode] = useState(false);
@@ -916,7 +945,8 @@ function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, on
     const newM = [...group.members, input];
     const newUids = [...group.memberUids, dummyUid];
     const newDetails = { ...(group.memberDetails || {}), [input]: { avatar: "" } };
-    onUpdate({ ...group, members: newM, memberUids: newUids, memberDetails: newDetails });
+    const newJoinedAt = { ...(group.memberJoinedAt || {}), [input]: Date.now() };
+    onUpdate({ ...group, members: newM, memberUids: newUids, memberDetails: newDetails, memberJoinedAt: newJoinedAt });
     setNewMemberName("");
   };
 
@@ -929,7 +959,8 @@ function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, on
     const newM = [...group.members, f.name];
     const newUids = [...group.memberUids, dummyUid];
     const newDetails = { ...(group.memberDetails || {}), [f.name]: { avatar: f.avatar || "" } };
-    onUpdate({ ...group, members: newM, memberUids: newUids, memberDetails: newDetails });
+    const newJoinedAt = { ...(group.memberJoinedAt || {}), [f.name]: Date.now() };
+    onUpdate({ ...group, members: newM, memberUids: newUids, memberDetails: newDetails, memberJoinedAt: newJoinedAt });
   };
 
   return (
@@ -938,8 +969,8 @@ function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, on
 
       <Card style={{background:"#f5f3ff",marginBottom:10}}>
         <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12}}>
-          <SecTitle icon="🔗" title="Link mời bạn bè" color="#7c3aed" />
-          <button onClick={() => setShowQR(!showQR)} style={{background: showQR ? "#7c3aed" : "#ede9fe", color: showQR ? "#fff" : "#7c3aed", border: "none", borderRadius: 8, padding: "5px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer"}}>QR Code</button>
+          <SecTitle icon="🔗" title="Link mời bạn bè" color="#059669" />
+          <button onClick={() => setShowQR(!showQR)} style={{background: showQR ? "#059669" : "#ecfdf5", color: showQR ? "#fff" : "#059669", border: "none", borderRadius: 8, padding: "5px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer"}}>QR Code</button>
         </div>
         
         {showQR ? (
@@ -948,8 +979,8 @@ function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, on
           </div>
         ) : (
           <div style={{display:"flex",alignItems:"center",gap:8}}>
-            <div style={{flex:1,background:"#ede9fe",borderRadius:9,padding:"10px 14px",fontWeight:800,fontSize:14,color:"#7c3aed",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{inviteLink}</div>
-            <button onClick={copyCode} style={{background:copiedCode?"#059669":"#7c3aed",color:"#fff",border:"none",borderRadius:9,padding:"10px 14px",fontWeight:700,fontSize:12,cursor:"pointer"}}>{copiedCode?"✅ Đã copy":"📋 Copy"}</button>
+            <div style={{flex:1,background:"#ecfdf5",borderRadius:9,padding:"10px 14px",fontWeight:800,fontSize:14,color:"#059669",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{inviteLink}</div>
+            <button onClick={copyCode} style={{background:copiedCode?"#059669":"#059669",color:"#fff",border:"none",borderRadius:9,padding:"10px 14px",fontWeight:700,fontSize:12,cursor:"pointer"}}>{copiedCode?"✅ Đã copy":"📋 Copy"}</button>
           </div>
         )}
       </Card>
@@ -959,7 +990,7 @@ function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, on
         <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
           {group.members.map((m,i)=>(
             <div key={i} style={{display:"flex",alignItems:"center",gap:8,background:"#f8fafc",padding:"8px 10px",borderRadius:10}}>
-              <Av name={m} size={28} ci={group.members.indexOf(m)} avatar={group.memberDetails?.[m]?.avatar}/>
+              <Av name={m} size={28} ci={group.members.indexOf(m)} avatar={memberAvatars?.[m] || group.memberDetails?.[m]?.avatar}/>
               <span style={{flex:1,fontSize:13,fontWeight:600}}>{m}</span>
               {m !== group.leader && isLeader && (
                 <div onClick={() => {
@@ -1033,7 +1064,7 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
 
   const memberStats = useMemo(() => {
     // We pre-calculate all splits for all expenses
-    const expenseSplits = expenses.map(e => getExpenseSplits(e, members));
+    const expenseSplits = expenses.map(e => getExpenseSplits(e, group));
     
     return members.map((m, i) => {
       const share = expenses.reduce((s, e, idx) => s + (expenseSplits[idx][m] || 0), 0);
@@ -1094,7 +1125,7 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
       <SecTitle icon="📊" title="Thống kê" color="#2563eb"/>
       <div style={{display:"flex",background:"#f1f5f9",borderRadius:10,padding:3,gap:2,marginBottom:20}}>
         {[["spend","💰 Tiền chi"],["debt","⚖️ Nợ"],["cat","📂 Loại"],["trend","📈 Xu hướng"]].map(([v,l])=>(
-          <button key={v} onClick={()=>setChartView(v)} style={{flex:1,padding:"8px 1px",border:"none",borderRadius:8,background:chartView===v?"#7c3aed":"transparent",color:chartView===v?"#fff":"#64748b",fontWeight:700,fontSize:10,transition:"all 0.2s",cursor:"pointer"}}>{l}</button>
+          <button key={v} onClick={()=>setChartView(v)} style={{flex:1,padding:"8px 1px",border:"none",borderRadius:8,background:chartView===v?"#059669":"transparent",color:chartView===v?"#fff":"#64748b",fontWeight:700,fontSize:10,transition:"all 0.2s",cursor:"pointer"}}>{l}</button>
         ))}
       </div>
 
@@ -1139,15 +1170,15 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
             <AreaChart data={trendData} margin={{ top: 10, right: 10, left: 10, bottom: 20 }}>
               <defs>
                 <linearGradient id="colorAmt" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#7c3aed" stopOpacity={0.3}/>
-                  <stop offset="95%" stopColor="#7c3aed" stopOpacity={0}/>
+                  <stop offset="5%" stopColor="#059669" stopOpacity={0.3}/>
+                  <stop offset="95%" stopColor="#34d399" stopOpacity={0}/>
                 </linearGradient>
               </defs>
               <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
               <XAxis dataKey="name" fontSize={10} stroke="#94a3b8" dy={10} />
               <YAxis fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v)} width={40} />
               <Tooltip formatter={(v:any)=>fmt(v)} />
-              <Area type="monotone" dataKey="amount" stroke="#7c3aed" strokeWidth={3} fillOpacity={1} fill="url(#colorAmt)" />
+              <Area type="monotone" dataKey="amount" stroke="#059669" strokeWidth={3} fillOpacity={1} fill="url(#colorAmt)" />
             </AreaChart>
           )}
         </ResponsiveContainer>
@@ -1155,7 +1186,7 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
 
       <div style={{ marginTop: 16, display: "flex", flexWrap: "wrap", gap: 12, justifyContent: "center" }}>
         {chartView === "spend" ? (
-          <div style={{fontSize:12,color:"#64748b"}}>Tổng chi tiêu nhóm: <b style={{color:"#7c3aed"}}>{fmt(totalSpend)}</b></div>
+          <div style={{fontSize:12,color:"#64748b"}}>Tổng chi tiêu nhóm: <b style={{color:"#059669"}}>{fmt(totalSpend)}</b></div>
         ) : chartView === "debt" ? (
           <div style={{display:"flex",gap:12}}>
             <div style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:"#64748b"}}>
@@ -1192,7 +1223,7 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
 function EmailSettingsModal({ prefs, onUpdate, onClose }: { prefs: UserPrefs, onUpdate: (p: Partial<UserPrefs>) => void, onClose: () => void }) {
   return (
     <Modal onClose={onClose}>
-      <SecTitle icon="📨" title="Thông báo Email" color="#7c3aed" />
+      <SecTitle icon="📨" title="Thông báo Email" color="#059669" />
       <div style={{display: "flex", flexDirection: "column", gap: 10, marginTop: 10}}>
          {[
            { id: "emailOnPayment", label: "Có người trả tiền", desc: "Nhận mail khi có thành viên thanh toán trong nhóm" },
@@ -1209,7 +1240,7 @@ function EmailSettingsModal({ prefs, onUpdate, onClose }: { prefs: UserPrefs, on
               <div 
                 onClick={() => onUpdate({ [item.id]: !((prefs as any)[item.id]) })}
                 style={{
-                  width: 44, height: 24, borderRadius: 12, background: (prefs as any)[item.id] ? "#7c3aed" : "#e2e8f0",
+                  width: 44, height: 24, borderRadius: 12, background: (prefs as any)[item.id] ? "#059669" : "#e2e8f0",
                   position: "relative", cursor: "pointer", transition: "0.2s"
                 }}
               >
@@ -1384,7 +1415,7 @@ function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddEx
     return (
       <div style={{padding: "20px 14px", paddingBottom: 100, maxWidth: 500, margin: "0 auto", textAlign: "center"}}>
         <SecTitle icon="📷" title="Quét Hóa Đơn AI" color="#fff" textColor="#fff" />
-        <div style={{padding: 40, color: "#fff", fontSize: 16, fontWeight: 500, background: "rgba(255,255,255,0.1)", borderRadius: 16, marginTop: 20}}>
+        <div style={{padding: 40, color: "#1a4d53", fontSize: 16, fontWeight: 500, background: "rgba(255,255,255,0.2)", borderRadius: 16, marginTop: 20}}>
           Bạn cần tham gia ít nhất 1 nhóm để quét hóa đơn.
         </div>
       </div>
@@ -1397,19 +1428,19 @@ function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddEx
       
       {step === 1 && (
         <Card>
-          <div style={{fontWeight: 700, fontSize: 13, marginBottom: 10}}>Chọn nhóm thanh toán:</div>
-          <select value={groupId} onChange={e=>setGroupId(e.target.value)} style={{width: "100%", padding: 10, borderRadius: 10, border: "2px solid #e2e8f0", marginBottom: 20, outline: "none"}}>
+          <div style={{fontWeight: 700, fontSize: 13, marginBottom: 10, color: "#0b565e"}}>Chọn nhóm thanh toán:</div>
+          <select value={groupId} onChange={e=>setGroupId(e.target.value)} style={{width: "100%", padding: 10, borderRadius: 10, border: "2px solid rgba(11,86,94,0.2)", marginBottom: 20, outline: "none", color: "#0b565e"}}>
             <option value="">-- Chọn nhóm --</option>
             {groups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
           </select>
 
           {groupId && !isCameraLive && (
              <div style={{display: "flex", flexDirection: "column", gap: 10}}>
-                <button onClick={startCamera} style={{display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: 15, background: "linear-gradient(135deg,#ec4899,#f43f5e)", border: "none", color: "#fff", borderRadius: 12, cursor: "pointer", fontWeight: 700}}>
+                <button onClick={startCamera} style={{display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: 15, background: "linear-gradient(135deg,#0b565e,#1a4d53)", border: "none", color: "#fff", borderRadius: 12, cursor: "pointer", fontWeight: 700}}>
                    <Camera size={28} />
                    <span style={{ fontSize: 14 }}>Máy ảnh (Chụp AI)</span>
                 </button>
-                <label style={{display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: 15, background: "#f8fafc", color: "#64748b", border: "2px dashed #cbd5e1", borderRadius: 12, cursor: "pointer", fontWeight: 700}}>
+                <label style={{display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: 15, background: "rgba(255,255,255,0.4)", color: "#0b565e", border: "2px dashed rgba(11,86,94,0.3)", borderRadius: 12, cursor: "pointer", fontWeight: 700}}>
                    <Upload size={28} />
                    <span style={{ fontSize: 14 }}>Tải ảnh lên</span>
                    <input type="file" accept="image/*" onChange={handleImage} style={{display: "none"}} />
@@ -1511,7 +1542,7 @@ function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddEx
   );
 }
 
-function GroupView({ group, friends, currentUserName, onUpdate, onDelete, onLeave, onBack }: { group: Group, friends: Friend[], currentUserName: string, onUpdate: (g: Group) => void, onDelete: () => void, onLeave: () => void, onBack: () => void }) {
+function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBack }: { group: Group, friends: Friend[], profile: UserProfile | null, onUpdate: (g: Group) => void, onDelete: () => void, onLeave: () => void, onBack: () => void }) {
   const [subTab,setSubTab]=useState("home");
   const [selectedBill,setSelectedBill]=useState<Expense | null>(null);
   const [showAddExp,setShowAddExp]=useState(false);
@@ -1523,6 +1554,39 @@ function GroupView({ group, friends, currentUserName, onUpdate, onDelete, onLeav
   const [feed, setFeed] = useState<FeedItem[]>([]);
 
   const members  = group.members||[];
+  const currentUserName = profile?.name || "";
+
+  const resolveMemberDisplay = (name: string) => {
+    const idx = members.indexOf(name);
+    const uid = group.memberUids?.[idx];
+    const isMe = uid === auth.currentUser?.uid;
+    const isLeader = uid === group.leaderUid || name === group.leader;
+    
+    let finalName = name;
+    if (name === "Bạn" || name === "Thành viên" || name === "Trưởng nhóm") {
+      if (isMe && currentUserName && currentUserName !== name) {
+        finalName = currentUserName;
+      } else if (isLeader && group.leader && group.leader !== name) {
+        finalName = group.leader;
+      }
+    }
+    
+    return { name: finalName || "Thành viên", isMe, isLeader };
+  };
+
+  const memberAvatars = useMemo(() => {
+    const map: Record<string, string> = {};
+    members.forEach(m => {
+      const { isMe } = resolveMemberDisplay(m);
+      let av = isMe ? (profile?.avatar || group.memberDetails?.[m]?.avatar) : group.memberDetails?.[m]?.avatar;
+      if (!av) {
+        const friend = friends.find(f => f.name === m);
+        if (friend?.avatar) av = friend.avatar;
+      }
+      if (av) map[m] = av;
+    });
+    return map;
+  }, [members, profile?.avatar, group.memberDetails, friends, group.memberUids, auth.currentUser?.uid]);
 
   useEffect(() => {
     if (!group.id) return;
@@ -1542,11 +1606,11 @@ function GroupView({ group, friends, currentUserName, onUpdate, onDelete, onLeav
     try {
       const mainPayer = Object.keys(exp.payers).find(k => (exp.payers[k] || 0) > 0) || "Ai đó";
       const { id, ...data } = exp;
-      await addDoc(collection(db, "groups", group.id, "expenses"), { 
+      await addDoc(collection(db, "groups", group.id, "expenses"), clean({ 
         ...data, 
         createdBy: auth.currentUser?.uid,
         memberDetails: group.memberDetails || {} 
-      });
+      }));
       await addDoc(collection(db, "groups", group.id, "feed"), {
         type: "expense",
         text: `${mainPayer} đã thêm "${exp.desc}" — ${fmt(exp.amount)}`,
@@ -1564,7 +1628,7 @@ function GroupView({ group, friends, currentUserName, onUpdate, onDelete, onLeav
   const addPayment = async (p: any) => {
     try {
       const { id, ...data } = p;
-      await addDoc(collection(db, "groups", group.id, "payments"), { ...data, createdBy: auth.currentUser?.uid });
+      await addDoc(collection(db, "groups", group.id, "payments"), clean({ ...data, createdBy: auth.currentUser?.uid }));
       await addDoc(collection(db, "groups", group.id, "feed"), {
         type: "paid",
         text: `${p.from} đã trả ${fmt(p.amount)} cho ${p.to}${p.note?" · "+p.note:""}`,
@@ -1579,24 +1643,43 @@ function GroupView({ group, friends, currentUserName, onUpdate, onDelete, onLeav
 
   const { total, balances, transactions } = useMemo(() => computeGroupBalances({ ...group, expenses, payments }), [group, expenses, payments]);
 
-  const resolveMemberDisplay = (name: string) => {
-    const idx = members.indexOf(name);
-    const uid = group.memberUids?.[idx];
-    const isMe = uid === auth.currentUser?.uid;
-    const isLeader = uid === group.leaderUid || name === group.leader;
+  const [viewingMember, setViewingMember] = useState<string | null>(null);
+
+  const memberStats = useMemo(() => {
+    if (!viewingMember) return null;
+    const m = viewingMember;
     
-    let finalName = name;
-    // Fallback for generic names
-    if (name === "Bạn" || name === "Thành viên" || name === "Trưởng nhóm") {
-      if (isMe && currentUserName && currentUserName !== name) {
-        finalName = currentUserName;
-      } else if (isLeader && group.leader && group.leader !== name) {
-        finalName = group.leader;
-      }
-    }
-    
-    return { name: finalName || "Thành viên", isMe, isLeader };
-  };
+    let spentByMember = 0;
+    let spentForMe = 0;
+    let paidByMember = 0;
+    let receivedByMember = 0;
+
+    expenses.forEach(e => {
+        if (e.payers[m]) {
+            spentByMember += e.payers[m];
+            
+            // Calculate how much of this was for me
+            const { isMe: isMeViewing } = resolveMemberDisplay(m);
+            const { isMe: iAmPaying } = resolveMemberDisplay(currentUserName); 
+            
+            const parts = e.participants || [];
+            if (parts.includes(currentUserName) && m !== currentUserName) {
+                // If they paid and I am a participant, calculate my share in their payment
+                // Simple equal split for this breakdown
+                spentForMe += e.payers[m] / parts.length;
+            }
+        }
+    });
+
+    payments.forEach(p => {
+        if (p.from === m) paidByMember += p.amount;
+        if (p.to === m) receivedByMember += p.amount;
+    });
+
+    const netBalance = balances[m] || 0;
+
+    return { spentByMember, spentForMe, paidByMember, receivedByMember, netBalance };
+  }, [viewingMember, expenses, payments, balances, currentUserName]);
 
   const subtabs=[{id:"home",icon:"🏠"},{id:"expenses",icon:"🧾"},{id:"stats",icon:"📊"},{id:"members",icon:"👥"},{id:"feed",icon:"🔔"}];
 
@@ -1605,27 +1688,28 @@ function GroupView({ group, friends, currentUserName, onUpdate, onDelete, onLeav
       {selectedBill && (
         <BillDetailModal 
           bill={selectedBill} 
-          members={members} 
+          group={group} 
+          memberAvatars={memberAvatars}
           onClose={() => setSelectedBill(null)} 
         />
       )}
-      {showAddExp&&<AddExpenseModal members={members} memberDetails={group.memberDetails} onAdd={addExpense} onClose={()=>setShowAddExp(false)}/>}
-      {showPay&&<PayModal members={members} memberDetails={group.memberDetails} transactions={transactions} onPay={addPayment} onClose={()=>setShowPay(false)}/>}
-      {showSettings&&<GroupSettingsModal group={group} friends={friends} currentUser={auth.currentUser?.displayName || ""} onClose={()=>setShowSettings(false)} onUpdate={onUpdate} onLeave={onLeave} onDelete={onDelete}/>}
+      {showAddExp&&<AddExpenseModal members={members} memberAvatars={memberAvatars} onAdd={addExpense} onClose={()=>setShowAddExp(false)}/>}
+      {showPay&&<PayModal members={members} memberAvatars={memberAvatars} transactions={transactions} onPay={addPayment} onClose={()=>setShowPay(false)}/>}
+      {showSettings&&<GroupSettingsModal group={group} friends={friends} currentUser={auth.currentUser?.displayName || ""} memberAvatars={memberAvatars} onClose={()=>setShowSettings(false)} onUpdate={onUpdate} onLeave={onLeave} onDelete={onDelete}/>}
 
-      <div style={{background:"linear-gradient(135deg,#7c3aed,#a78bfa)",padding:"12px 16px 0",flexShrink:0}}>
+      <div style={{background:"linear-gradient(135deg, #0b565e, #147f87)",padding:"12px 16px 0",flexShrink:0}}>
         <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
           <button onClick={onBack} style={{background:"rgba(255,255,255,0.2)", border:"none", borderRadius:8, width:32, height:32, color:"#fff", fontSize:24, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center"}}>‹</button>
           <div style={{fontSize:32}}>{group.emoji}</div>
           <div style={{flex:1}}>
             <div style={{color:"#fff",fontWeight:800,fontSize:17}}>{group.name}</div>
-            <div style={{color:"#ddd6fe",fontSize:11}}>{members.length} thành viên · {total > 0 ? fmt(total) : "Chưa chi"}</div>
+            <div style={{color:"rgba(255,255,255,0.9)",fontSize:11,fontWeight:600}}>{members.length} thành viên · {total > 0 ? fmt(total) : "Chưa chi"}</div>
           </div>
           <button onClick={()=>setShowSettings(true)} style={{background:"rgba(255,255,255,.2)",border:"none",borderRadius:9,width:34,height:34,color:"#fff",fontSize:16,cursor:"pointer"}}>⚙️</button>
         </div>
         <div style={{display:"flex",gap:2}}>
           {subtabs.map(t=>(
-            <button key={t.id} onClick={()=>setSubTab(t.id)} style={{flex:1,padding:"8px 4px",border:"none",background:"none",color:subTab===t.id?"#fff":"rgba(255,255,255,.6)",fontSize:18,cursor:"pointer",borderBottom:subTab===t.id?"2px solid #fff":"2px solid transparent"}}>{t.icon}</button>
+            <button key={t.id} onClick={()=>setSubTab(t.id)} style={{flex:1,padding:"8px 4px",border:"none",background:"none",color:subTab===t.id?"#fff":"rgba(255,255,255,.6)",fontSize:18,cursor:"pointer",borderBottom:subTab===t.id?"2px solid #fff":"2px solid transparent",transition:"color 0.2s"}}>{t.icon}</button>
           ))}
         </div>
       </div>
@@ -1644,9 +1728,11 @@ function GroupView({ group, friends, currentUserName, onUpdate, onDelete, onLeav
                 ):transactions.map((t,i)=>{
                   const fromRes = resolveMemberDisplay(t.from);
                   const toRes = resolveMemberDisplay(t.to);
+                  const fromAvatar = fromRes.isMe ? (profile?.avatar || group.memberDetails?.[t.from]?.avatar) : group.memberDetails?.[t.from]?.avatar;
+                  
                   return (
                     <div key={i} style={{display:"flex",alignItems:"center",gap:4,padding:"9px 0",borderBottom:i<transactions.length-1?"1px solid #f3f4f6":"none"}}>
-                      <Av name={fromRes.name} size={32} ci={members.indexOf(t.from)} avatar={group.memberDetails?.[t.from]?.avatar}/>
+                      <Av name={fromRes.name} size={32} ci={members.indexOf(t.from)} avatar={fromAvatar}/>
                       <div style={{flex:1,fontSize:13,fontWeight:700}}>
                         <span style={{color:"#dc2626", display: "inline-flex", alignItems: "center", gap: 3}}>
                           {fromRes.name}
@@ -1660,7 +1746,7 @@ function GroupView({ group, friends, currentUserName, onUpdate, onDelete, onLeav
                           {toRes.isMe && <span style={{fontWeight: 400, fontSize: 11, color: "#94a3b8"}}>(Bạn)</span>}
                         </span>
                       </div>
-                      <span style={{fontWeight:800,fontSize:14,color:"#7c3aed"}}>{fmt(t.amount)}</span>
+                      <span style={{fontWeight:800,fontSize:14,color:"#059669"}}>{fmt(t.amount)}</span>
                     </div>
                   );
                 })}
@@ -1682,7 +1768,7 @@ function GroupView({ group, friends, currentUserName, onUpdate, onDelete, onLeav
                         <div style={{width:38,height:38,borderRadius:11,background:"#ede9fe",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>🧾</div>
                         <div style={{flex:1}}>
                           <div style={{fontWeight:800,fontSize:14}}>{e.desc}</div>
-                          <div style={{fontSize:11,color:"#7c3aed",fontWeight:600}}>
+                          <div style={{fontSize:11,color:"#059669",fontWeight:600}}>
                             {Object.keys(e.payers).filter(k => (e.items ? e.payers[k] : (e.payers[k] || 0)) > 0).join(", ")}
                           </div>
                         </div>
@@ -1707,10 +1793,10 @@ function GroupView({ group, friends, currentUserName, onUpdate, onDelete, onLeav
                 }
               })}
             {(expenses.length === 0 && (!payments || payments.length === 0)) && (
-              <div style={{textAlign:"center", padding: 40, color: "#94a3b8"}}>
-                <div style={{fontSize: 40, marginBottom: 10}}>🧾</div>
-                <div style={{fontWeight: 700}}>Chưa có hoạt động nào</div>
-                <div style={{fontSize: 12}}>Các khoản chi và thanh toán sẽ hiện ở đây</div>
+              <div style={{textAlign:"center", padding: "60px 20px", color: "#fff"}}>
+                <div style={{fontSize: 64, marginBottom: 20, filter: "drop-shadow(0 0 20px rgba(255,255,255,0.3))"}}>🧾</div>
+                <div style={{fontWeight: 900, fontSize: 20, marginBottom: 8, letterSpacing: -0.5}}>Chưa có hoạt động nào</div>
+                <div style={{fontSize: 14, opacity: 0.9, maxWidth: 200, margin: "0 auto", lineHeight: 1.5}}>Các khoản chi và thanh toán sẽ hiện ở đây</div>
               </div>
             )}
           </>
@@ -1722,47 +1808,110 @@ function GroupView({ group, friends, currentUserName, onUpdate, onDelete, onLeav
 
         {subTab==="members"&&(
           <div>
-            <div style={{ background: "linear-gradient(135deg, #7c3aed 0%, #4c1d95 100%)", borderRadius: 20, padding: 24, color: "#fff", marginBottom: 20, boxShadow: "0 10px 25px -5px rgba(124, 58, 237, 0.3)" }}>
+            <div style={{ background: "linear-gradient(135deg, #0b565e, #147f87)", borderRadius: 20, padding: 24, color: "#fff", marginBottom: 20, boxShadow: "0 10px 25px -5px rgba(11, 86, 94, 0.4)" }}>
               <div style={{ fontSize: 40, marginBottom: 8 }}>👥</div>
               <div style={{ fontSize: 24, fontWeight: 900 }}>{members.length} Thành viên</div>
-              <div style={{ fontSize: 13, opacity: 0.8, fontWeight: 500 }}>Những người đang cùng bạn chia sẻ mọi thứ</div>
+              <div style={{ fontSize: 13, opacity: 0.9, fontWeight: 600 }}>Những người đang cùng bạn chia sẻ mọi thứ</div>
             </div>
 
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {members.map((m, i) => (
-                <Card key={i} style={{ padding: "12px 14px", border: m === group.leader ? "1.5px solid #ddd6fe" : "none" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                    <Av name={m} size={42} ci={i} avatar={group.memberDetails?.[m]?.avatar} />
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontWeight: 800, fontSize: 15, color: "#1e293b", display: "flex", alignItems: "center", gap: 6 }}>
-                        {m}
-                        {m === group.leader && <span style={{ background: "#ede9fe", color: "#7c3aed", fontSize: 9, padding: "2px 6px", borderRadius: 10, fontWeight: 900 }}>TRƯỞNG NHÓM</span>}
+              {members.map((m, i) => {
+                const { isMe, isLeader } = resolveMemberDisplay(m);
+                let finalAvatar = isMe ? (profile?.avatar || group.memberDetails?.[m]?.avatar) : group.memberDetails?.[m]?.avatar;
+                
+                // Fallback to friends list avatar if missing
+                if (!finalAvatar) {
+                  const friend = friends.find(f => f.name === m);
+                  if (friend?.avatar) finalAvatar = friend.avatar;
+                }
+                
+                return (
+                  <Card key={i} onClick={() => setViewingMember(m)} style={{ padding: "12px 14px", border: isLeader ? "1.5px solid #ddd6fe" : "none", cursor: "pointer" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                      <Av name={m} size={42} ci={i} avatar={finalAvatar} />
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontWeight: 800, fontSize: 15, color: "#1e293b", display: "flex", alignItems: "center", gap: 6 }}>
+                          {m}
+                          {isLeader && <span style={{ background: "#ecfdf5", color: "#059669", fontSize: 9, padding: "2px 6px", borderRadius: 10, fontWeight: 900 }}>TRƯỞNG NHÓM</span>}
+                        </div>
                       </div>
-                      {(group.memberDetails?.[m]?.phone || group.memberDetails?.[m]?.email) && (
-                        <div style={{ fontSize: 10, color: "#94a3b8", display: "flex", gap: 8, marginTop: 2 }}>
-                           {group.memberDetails[m].phone && <span>📞 {group.memberDetails[m].phone}</span>}
-                           {group.memberDetails[m].email && <span>📧 {group.memberDetails[m].email}</span>}
-                        </div>
-                      )}
-                      {Math.abs(Math.round(balances[m] || 0)) >= 1 && (
-                        <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
-                          {(balances[m] || 0) > 0 ? "🟢 Đang dư tiền" : "🔴 Đang nợ tiền"}
-                        </div>
-                      )}
+                      <div style={{ fontSize: 18, color: "#94a3b8" }}>›</div>
                     </div>
-                    {Math.abs(Math.round(balances[m] || 0)) >= 1 && (
-                      <div style={{ fontWeight: 800, fontSize: 14, color: (balances[m] || 0) > 0 ? "#16a34a" : "#dc2626" }}>
-                        {(balances[m] || 0) > 0 ? "+" : ""}{fmt(balances[m] || 0)}
+                  </Card>
+                );
+              })}
+            </div>
+
+            {viewingMember && memberStats && (
+              <Modal onClose={() => setViewingMember(null)}>
+                <div style={{ textAlign: "center", marginBottom: 20 }}>
+                  <Av name={viewingMember} size={80} style={{ margin: "0 auto" }} avatar={
+                    (() => {
+                      const { isMe } = resolveMemberDisplay(viewingMember);
+                      let av = isMe ? (profile?.avatar || group.memberDetails?.[viewingMember]?.avatar) : group.memberDetails?.[viewingMember]?.avatar;
+                      if (!av) {
+                        const friend = friends.find(f => f.name === viewingMember);
+                        if (friend?.avatar) av = friend.avatar;
+                      }
+                      return av;
+                    })()
+                  } />
+                  <div style={{ fontWeight: 900, fontSize: 24, marginTop: 12 }}>{viewingMember}</div>
+                  {resolveMemberDisplay(viewingMember).isLeader && <div style={{ fontSize: 11, fontWeight: 800, color: "#059669", textTransform: "uppercase", marginTop: 4 }}>Trưởng nhóm</div>}
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
+                  <div style={{ background: "#f8fafc", padding: 14, borderRadius: 16, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, fontWeight: 800, color: "#64748b", textTransform: "uppercase", marginBottom: 4 }}>Đã chi cho nhóm</div>
+                    <div style={{ fontWeight: 800, fontSize: 16, color: "#0f172a" }}>{fmt(memberStats.spentByMember)}</div>
+                  </div>
+                  <div style={{ background: "#f8fafc", padding: 14, borderRadius: 16, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, fontWeight: 800, color: "#64748b", textTransform: "uppercase", marginBottom: 4 }}>Đã chi cho bạn</div>
+                    <div style={{ fontWeight: 800, fontSize: 16, color: "#059669" }}>{fmt(memberStats.spentForMe)}</div>
+                  </div>
+                  <div style={{ background: "#f8fafc", padding: 14, borderRadius: 16, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, fontWeight: 800, color: "#64748b", textTransform: "uppercase", marginBottom: 4 }}>Đã thanh toán</div>
+                    <div style={{ fontWeight: 800, fontSize: 16, color: "#2563eb" }}>{fmt(memberStats.paidByMember)}</div>
+                  </div>
+                  <div style={{ background: "#f8fafc", padding: 14, borderRadius: 16, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, fontWeight: 800, color: "#64748b", textTransform: "uppercase", marginBottom: 4 }}>Đã nhận về</div>
+                    <div style={{ fontWeight: 800, fontSize: 16, color: "#ea580c" }}>{fmt(memberStats.receivedByMember)}</div>
+                  </div>
+                </div>
+
+                <div style={{ background: memberStats.netBalance >= 0 ? "#ecfdf5" : "#fef2f2", padding: 16, borderRadius: 16, textAlign: "center", border: `1.5px solid ${memberStats.netBalance >= 0 ? "#059669" : "#dc2626"}` }}>
+                  <div style={{ fontSize: 11, fontWeight: 800, color: memberStats.netBalance >= 0 ? "#059669" : "#dc2626", textTransform: "uppercase", marginBottom: 6 }}>Tổng chênh lệch</div>
+                  <div style={{ fontWeight: 900, fontSize: 24, color: memberStats.netBalance >= 0 ? "#059669" : "#dc2626" }}>
+                    {memberStats.netBalance > 0 ? "+" : ""}{fmt(memberStats.netBalance)}
+                  </div>
+                  <div style={{ fontSize: 11, color: memberStats.netBalance >= 0 ? "#059669" : "#dc2626", marginTop: 4, opacity: 0.8 }}>
+                    {memberStats.netBalance >= 0 ? "Được nhận lại từ nhóm" : "Cần đóng thêm cho nhóm"}
+                  </div>
+                </div>
+
+                {(group.memberDetails?.[viewingMember]?.phone || group.memberDetails?.[viewingMember]?.email) && (
+                  <div style={{ marginTop: 20, borderTop: "1px solid #f1f5f9", paddingTop: 15 }}>
+                    <div style={{ fontSize: 11, fontWeight: 800, color: "#94a3b8", textTransform: "uppercase", marginBottom: 10 }}>Thông tin liên hệ</div>
+                    {group.memberDetails?.[viewingMember]?.phone && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, fontSize: 14, color: "#1e293b" }}>
+                        <span style={{ fontSize: 16 }}>📞</span> {group.memberDetails[viewingMember].phone}
+                      </div>
+                    )}
+                    {group.memberDetails?.[viewingMember]?.email && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 14, color: "#1e293b" }}>
+                        <span style={{ fontSize: 16 }}>📧</span> {group.memberDetails[viewingMember].email}
                       </div>
                     )}
                   </div>
-                </Card>
-              ))}
-            </div>
+                )}
+                
+                <Btn onClick={() => setViewingMember(null)} style={{ width: "100%", marginTop: 24, background: "#f1f5f9", color: "#64748b" }}>Đóng</Btn>
+              </Modal>
+            )}
 
             <Card style={{ marginTop: 20, background: "#f8fafc", border: "1px dashed #cbd5e1", textAlign: "center", padding: "20px" }}>
               <div style={{ fontSize: 13, color: "#64748b", marginBottom: 12 }}>Muốn thêm người mới vào nhóm?</div>
-              <Btn onClick={() => setShowSettings(true)} style={{ background: "#7c3aed", fontSize: 13 }}>
+              <Btn onClick={() => setShowSettings(true)} style={{ background: "#059669", fontSize: 13 }}>
                 ➕ Quản lý thành viên
               </Btn>
             </Card>
@@ -1819,10 +1968,10 @@ function FriendActionModal({ friend, groups, onClose, onPay }: { friend: Friend,
   return (
     <Modal onClose={onClose}>
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
-        <Av name={friend.name} size={54} ci={0} />
+        <Av name={friend.name} size={54} ci={0} avatar={friend.avatar} />
         <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 800, fontSize: 18 }}>{friend.name}</div>
-          <div style={{ fontSize: 13, color: "#64748b" }}>{friendBalances.sharedGroupsCount} nhóm chung</div>
+          <div style={{ fontWeight: 800, fontSize: 18, color: "#0b565e" }}>{friend.name}</div>
+          <div style={{ fontSize: 13, color: "#2d666d" }}>{friendBalances.sharedGroupsCount} nhóm chung</div>
         </div>
       </div>
 
@@ -1849,20 +1998,20 @@ function FriendActionModal({ friend, groups, onClose, onPay }: { friend: Friend,
         </Btn>
       </div>
 
-      <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 10, color: "#1e293b" }}>Chi tiết từng nhóm:</div>
+      <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 10, color: "#0b565e" }}>Chi tiết từng nhóm:</div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {friendBalances.groupDetails.map((gd, i) => (
-          <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: "#f8fafc", padding: "10px 12px", borderRadius: 12 }}>
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: "rgba(255,255,255,0.4)", padding: "10px 12px", borderRadius: 12, border: "1px solid rgba(11,86,94,0.1)" }}>
             <span style={{ fontSize: 20 }}>{gd.emoji}</span>
-            <span style={{ flex: 1, fontSize: 13, fontWeight: 600 }}>{gd.name}</span>
+            <span style={{ flex: 1, fontSize: 13, fontWeight: 700, color: "#0b565e" }}>{gd.name}</span>
             {Math.abs(Math.round(gd.balance)) >= 1 && (
-              <span style={{ fontWeight: 800, fontSize: 13, color: gd.balance >= 0 ? "#16a34a" : "#dc2626" }}>
+              <span style={{ fontWeight: 800, fontSize: 13, color: gd.balance >= 0 ? "#059669" : "#dc2626" }}>
                 {gd.balance >= 0 ? "+" : ""}{fmt(gd.balance)}
               </span>
             )}
           </div>
         ))}
-        {friendBalances.groupDetails.length === 0 && <div style={{ textAlign: "center", color: "#94a3b8", fontSize: 12, padding: 10 }}>Không có nhóm chung nào.</div>}
+        {friendBalances.groupDetails.length === 0 && <div style={{ textAlign: "center", color: "#2d666d", fontSize: 12, padding: 10 }}>Không có nhóm chung nào.</div>}
       </div>
     </Modal>
   );
@@ -1896,12 +2045,12 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
       {selectedFriend && <FriendActionModal friend={selectedFriend} groups={groups} onClose={() => setSelectedFriend(null)} onPay={(g) => { setSelectedFriend(null); onPayClick(g); }} />}
       
       <Card style={{ padding: "18px", marginBottom: 20 }}>
-        <SecTitle icon="👥" title="Thêm bạn mới" color="#7c3aed" />
+        <SecTitle icon="👥" title="Thêm bạn mới" color="#059669" />
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           <Input placeholder="Họ và tên..." value={name} onChange={(e: any) => setName(e.target.value)} />
           <Input placeholder="Địa chỉ email (không bắt buộc)..." value={email} onChange={(e: any) => setEmail(e.target.value)} />
           <div style={{ fontSize: 11, color: "#64748b", marginTop: -4, marginLeft: 4 }}>* Nhập email để gửi lời mời, hoặc để trống để thêm vào danh sách ngay.</div>
-          <Btn onClick={add} style={{ marginTop: 4, background: "linear-gradient(135deg,#7c3aed,#a78bfa)" }}>✨ {email.trim() ? "Gửi lời mời" : "Thêm ngay"}</Btn>
+          <Btn onClick={add} style={{ marginTop: 4, background: "linear-gradient(135deg,#059669,#34d399)" }}>✨ {email.trim() ? "Gửi lời mời" : "Thêm ngay"}</Btn>
         </div>
       </Card>
       
@@ -1919,7 +2068,7 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
             cursor: "pointer", 
             transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)", 
             background: activeTab === "list" ? "rgba(255,255,255,0.95)" : "transparent", 
-            color: activeTab === "list" ? "#7c3aed" : "rgba(255,255,255,0.8)",
+            color: activeTab === "list" ? "#059669" : "rgba(255,255,255,0.8)",
             boxShadow: activeTab === "list" ? "0 4px 12px rgba(0,0,0,0.1)" : "none",
             display: "flex",
             alignItems: "center",
@@ -1928,7 +2077,7 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
           }}
         >
           <span>👥 Bạn bè</span>
-          <span style={{ fontSize: 10, background: activeTab === "list" ? "#7c3aed" : "rgba(255,255,255,0.2)", color: "#fff", padding: "1px 6px", borderRadius: 8 }}>{acceptedFriends.length}</span>
+          <span style={{ fontSize: 10, background: activeTab === "list" ? "#059669" : "rgba(255,255,255,0.2)", color: "#fff", padding: "1px 6px", borderRadius: 8 }}>{acceptedFriends.length}</span>
         </button>
         <button 
           onClick={() => setActiveTab("pending")}
@@ -1942,7 +2091,7 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
             cursor: "pointer", 
             transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)", 
             background: activeTab === "pending" ? "rgba(255,255,255,0.95)" : "transparent", 
-            color: activeTab === "pending" ? "#7c3aed" : "rgba(255,255,255,0.8)",
+            color: activeTab === "pending" ? "#059669" : "rgba(255,255,255,0.8)",
             boxShadow: activeTab === "pending" ? "0 4px 12px rgba(0,0,0,0.1)" : "none",
             display: "flex",
             alignItems: "center",
@@ -1960,10 +2109,10 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
           {acceptedFriends.map((f, i) => (
             <Card key={f.id || i} onClick={() => setSelectedFriend(f)} style={{ padding: "12px 14px", marginBottom: 7, cursor: "pointer" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                <Av name={f.name} size={42} ci={i} />
+                <Av name={f.name} size={42} ci={i} avatar={f.avatar} />
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 700, fontSize: 14 }}>{f.name}</div>
-                  {f.email && <div style={{ fontSize: 11, color: "#94a3b8" }}>✉️ {f.email}</div>}
+                  <div style={{ fontWeight: 700, fontSize: 14, color: "#0b565e" }}>{f.name}</div>
+                  {f.email && <div style={{ fontSize: 11, color: "#2d666d" }}>✉️ {f.email}</div>}
                 </div>
                 {deletingId === f.id ? (
                   <div style={{ display: "flex", gap: 6 }}>
@@ -1994,17 +2143,17 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
               </div>
             </Card>
           ))}
-          {acceptedFriends.length === 0 && <div style={{ textAlign: "center", padding: "40px 20px", color: "rgba(255,255,255,0.6)", fontSize: 14 }}>Bạn chưa có người bạn nào.</div>}
+          {acceptedFriends.length === 0 && <div style={{ textAlign: "center", padding: "40px 20px", color: "#1a4d53", fontSize: 14, fontWeight: 600 }}>Bạn chưa có người bạn nào.</div>}
         </>
       ) : (
         <>
           {pendingFriends.map((f, i) => (
             <Card key={f.id || i} style={{ padding: "12px 14px", marginBottom: 7, opacity: 0.9 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                <Av name={f.name} size={42} ci={i + acceptedFriends.length} />
+                <Av name={f.name} size={42} ci={i + acceptedFriends.length} avatar={f.avatar} />
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 700, fontSize: 14, color: "#64748b" }}>{f.name}</div>
-                  <div style={{ fontSize: 11, color: "#94a3b8", display: "flex", alignItems: "center", gap: 6 }}>
+                  <div style={{ fontWeight: 700, fontSize: 14, color: "#0b565e" }}>{f.name}</div>
+                  <div style={{ fontSize: 11, color: "#2d666d", display: "flex", alignItems: "center", gap: 6 }}>
                     <span>✉️ {f.email}</span>
                   </div>
                 </div>
@@ -2012,7 +2161,7 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
                   <div style={{ display: "flex", gap: 6 }}>
                     <button 
                       onClick={(e) => { e.stopPropagation(); setDeletingId(null); }} 
-                      style={{ background: "#e2e8f0", border: "none", color: "#475569", borderRadius: 8, padding: "6px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}
+                      style={{ background: "#f1f5f9", border: "none", color: "#0b565e", borderRadius: 8, padding: "6px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}
                     >
                       Bỏ
                     </button>
@@ -2037,7 +2186,7 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
               </div>
             </Card>
           ))}
-          {pendingFriends.length === 0 && <div style={{ textAlign: "center", padding: "40px 20px", color: "rgba(255,255,255,0.6)", fontSize: 14 }}>Không có lời mời nào đang chờ.</div>}
+          {pendingFriends.length === 0 && <div style={{ textAlign: "center", padding: "40px 20px", color: "#1a4d53", fontSize: 14, fontWeight: 600 }}>Không có lời mời nào đang chờ.</div>}
         </>
       )}
     </div>
@@ -2076,7 +2225,7 @@ function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { gro
         <Modal onClose={()=>setShowCreate(false)}>
           <div style={{fontWeight:800,fontSize:16,marginBottom:14}}>🎉 Tạo nhóm mới</div>
           <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
-            {EMOJIS.map(e=><button key={e} onClick={()=>setGEmoji(e)} style={{width:38,height:38,borderRadius:9,fontSize:20,border:gEmoji===e?"2.5px solid #7c3aed":"2px solid #e2e8f0",background:gEmoji===e?"#f5f3ff":"#fff",cursor:"pointer"}}>{e}</button>)}
+            {EMOJIS.map(e=><button key={e} onClick={()=>setGEmoji(e)} style={{width:38,height:38,borderRadius:9,fontSize:20,border:gEmoji===e?"2.5px solid #059669":"2px solid #e2e8f0",background:gEmoji===e?"#f0fdf4":"#fff",cursor:"pointer"}}>{e}</button>)}
           </div>
           <Input placeholder="Tên nhóm..." value={gName} onChange={(e: any)=>setGName(e.target.value)} style={{marginBottom:15}}/>
           <Btn onClick={createGroup} style={{width:"100%", padding:"14px", fontSize: 14}}>✨ Tạo nhóm ngay</Btn>
@@ -2086,7 +2235,7 @@ function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { gro
       <div style={{display:"flex",gap:8,marginBottom:12}}>
         <button 
           onClick={() => setShowCreate(true)} 
-          style={{flex:1,background:"linear-gradient(135deg,#7c3aed,#a78bfa)",color:"#fff",border:"none",borderRadius:12,padding:"11px",fontWeight:700,fontSize:13,cursor:"pointer"}}
+          style={{flex:1,background:"linear-gradient(135deg,#059669,#34d399)",color:"#fff",border:"none",borderRadius:12,padding:"11px",fontWeight:700,fontSize:13,cursor:"pointer"}}
         >
           ✨ Tạo nhóm
         </button>
@@ -2101,9 +2250,9 @@ function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { gro
                 {g.emoji}
               </div>
               <div style={{flex:1}}>
-                <div style={{fontWeight:800,fontSize:15,color:"#1e293b",marginBottom:2}}>{g.name}</div>
-                <div style={{fontSize:11,color:"#64748b",display:"flex",alignItems:"center",gap:5}}>
-                  <span style={{background:"#f1f5f9",padding:"2px 6px",borderRadius:5,fontWeight:600}}>{g.members.length} người</span>
+                <div style={{fontWeight:800,fontSize:15,color:"#0b565e",marginBottom:2}}>{g.name}</div>
+                <div style={{fontSize:11,color:"#2d666d",display:"flex",alignItems:"center",gap:5}}>
+                  <span style={{background:"rgba(255,255,255,0.4)",padding:"2px 6px",borderRadius:5,fontWeight:600}}>{g.members.length} người</span>
                 </div>
               </div>
               <div style={{textAlign:"right",display:"flex",alignItems:"center",gap:8}}>
@@ -2155,18 +2304,18 @@ function GroupSuccessModal({ group, onClose }: { group: Group, onClose: () => vo
     <Modal onClose={onClose}>
       <div style={{ textAlign: "center", marginBottom: 20 }}>
         <div style={{ fontSize: 40, marginBottom: 10 }}>🎉</div>
-        <div style={{ fontWeight: 800, fontSize: 18, color: "#1e1e2e" }}>Tạo nhóm thành công!</div>
-        <div style={{ fontSize: 13, color: "#64748b", marginTop: 4 }}>Nhóm "{group.name}" đã sẵn sàng.</div>
+        <div style={{ fontWeight: 800, fontSize: 18, color: "#0b565e" }}>Tạo nhóm thành công!</div>
+        <div style={{ fontSize: 13, color: "#2d666d", marginTop: 4 }}>Nhóm "{group.name}" đã sẵn sàng.</div>
       </div>
 
-      <Card style={{ textAlign: "center", background: "#f8fafc" }}>
-        <div style={{ fontWeight: 700, fontSize: 12, color: "#475569", marginBottom: 16 }}>QUÉT MÃ HOẶC COPY LINK ĐỂ THAM GIA</div>
-        <div style={{ background: "#fff", padding: 16, borderRadius: 16, display: "inline-block", border: "1px solid #e2e8f0", marginBottom: 16 }}>
+      <Card style={{ textAlign: "center", background: "rgba(255,255,255,0.4)", border: "1.5px solid rgba(11,86,94,0.1)" }}>
+        <div style={{ fontWeight: 700, fontSize: 12, color: "#0b565e", marginBottom: 16 }}>QUÉT MÃ HOẶC COPY LINK ĐỂ THAM GIA</div>
+        <div style={{ background: "#fff", padding: 16, borderRadius: 16, display: "inline-block", border: "1px solid rgba(11,86,94,0.1)", marginBottom: 16 }}>
            <QRCode value={link} size={150} level="Q" />
         </div>
-        <div style={{ display: "flex", gap: 8, background: "#ede9fe", padding: 8, borderRadius: 12, alignItems: "center" }}>
-          <div style={{ flex: 1, fontSize: 11, color: "#7c3aed", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{link}</div>
-          <button onClick={copyLink} style={{ background: "#7c3aed", color: "#fff", border: "none", padding: "6px 12px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>{copied ? "Đã copy" : "Copy"}</button>
+        <div style={{ display: "flex", gap: 8, background: "rgba(11,86,94,0.1)", padding: 8, borderRadius: 12, alignItems: "center" }}>
+          <div style={{ flex: 1, fontSize: 11, color: "#0b565e", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{link}</div>
+          <button onClick={copyLink} style={{ background: "#0b565e", color: "#fff", border: "none", padding: "6px 12px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>{copied ? "Đã copy" : "Copy"}</button>
         </div>
       </Card>
 
@@ -2313,7 +2462,7 @@ export default function App() {
     const updated = { ...userPrefs, ...newPrefs };
     setUserPrefs(updated);
     try {
-      await updateDoc(doc(db, "users", user.uid), { prefs: updated });
+      await updateDoc(doc(db, "users", user.uid), { prefs: clean(updated) });
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, "prefs");
     }
@@ -2397,7 +2546,7 @@ export default function App() {
     if (!user) return;
     try {
       const { id, ...data } = g;
-      await updateDoc(doc(db, "groups", id), data);
+      await updateDoc(doc(db, "groups", id), clean(data));
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `groups/${g.id}`);
     }
@@ -2532,6 +2681,7 @@ export default function App() {
         ...g,
         members: [profile.name],
         memberUids: [user.uid],
+        memberDetails: { [profile.name]: { avatar: profile.avatar } },
         leader: profile.name,
         leaderUid: user.uid,
         createdBy: user.uid,
@@ -2565,17 +2715,48 @@ export default function App() {
     return [user?.uid].filter(Boolean) as string[];
   };
 
+  // Sync avatars for friends and groups
+  useEffect(() => {
+    if (!user || !friends.length) return;
+    
+    const syncAvatars = async () => {
+        const friendsToSync = friends.filter(f => f.email && !f.avatar);
+        if (friendsToSync.length === 0) return;
+
+        for (const f of friendsToSync) {
+            try {
+                const q = query(collection(db, "users"), where("email", "==", f.email));
+                const snap = await getDocs(q);
+                if (!snap.empty) {
+                    const userData = snap.docs[0].data();
+                    if (userData.avatar) {
+                        await updateDoc(doc(db, "users", user.uid, "friends", f.id!), {
+                            avatar: userData.avatar,
+                            avatarSyncedAt: Date.now()
+                        });
+                    }
+                }
+            } catch (e) {
+                console.error("Sync avatar error", e);
+            }
+        }
+    };
+
+    const timer = setTimeout(syncAvatars, 2000);
+    return () => clearTimeout(timer);
+  }, [user?.uid, friends.length]);
+
   const selectGroup = (g: Group) => { setActiveGroup(g); setTab("active"); };
 
   const addExpenseToGroup = async (groupId: string, exp: any) => {
     try {
       const g = groups.find(x => x.id === groupId);
       const { id, ...data } = exp;
-      await addDoc(collection(db, "groups", groupId, "expenses"), { 
+      await addDoc(collection(db, "groups", groupId, "expenses"), clean({ 
         ...data, 
         createdBy: auth.currentUser?.uid,
         memberDetails: g?.memberDetails || {}
-      });
+      }));
       const mainPayer = Object.keys(exp.payers).find(k => (exp.payers[k] || 0) > 0) || "Ai đó";
       await addDoc(collection(db, "groups", groupId, "feed"), {
         type: "expense",
@@ -2632,7 +2813,7 @@ export default function App() {
 
   if (loading) {
     return (
-      <div style={{minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", background:"#4c1d95", color:"#fff"}}>
+      <div style={{minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", background:"linear-gradient(135deg, #82edc0, #7be0dc, #7fe7cd, #88e7c8)", color:"#0b565e"}}>
          <div style={{fontSize: 24, fontWeight: 700}}>Đang tải...</div>
       </div>
     );
@@ -2640,17 +2821,17 @@ export default function App() {
 
   if (!user) {
     return (
-      <div style={{minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:"linear-gradient(135deg,#4c1d95 0%,#7c3aed 40%,#a78bfa 100%)", color:"#fff", padding:20, textAlign: "center"}}>
+      <div style={{minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:"linear-gradient(135deg, #82edc0, #7be0dc, #7fe7cd, #88e7c8)", color:"#0b565e", padding:20, textAlign: "center"}}>
         <div style={{fontSize:80, marginBottom:20}}>✨</div>
-        <h1 style={{fontSize: 32, fontWeight: 900, marginBottom: 10}}>Chào mừng đến với HappyShare</h1>
-        <p style={{fontSize: 14, color: "rgba(255,255,255,0.8)", marginBottom: 30, maxWidth: 300}}>
+        <h1 style={{fontSize: 32, fontWeight: 900, marginBottom: 10, color: "#0b565e"}}>Chào mừng đến với HappyShare</h1>
+        <p style={{fontSize: 14, color: "#0b565e", opacity: 0.8, marginBottom: 30, maxWidth: 300}}>
           Ứng dụng chia sẻ hóa đơn thông minh và minh bạch. Đăng nhập để bắt đầu!
         </p>
         <Btn onClick={login} disabled={loginLoading} style={{width: 260, fontSize: 16, padding: "14px 20px", marginBottom: 15, display: "flex", alignItems: "center", justifyContent: "center", gap: 10}}>
           {loginLoading ? <Loader2 className="animate-spin" size={20} /> : "🚀"} 
           {loginLoading ? "Đang xử lý..." : "Đăng nhập bằng Google"}
         </Btn>
-        <p style={{fontSize: 12, color: "rgba(255,255,255,0.6)", maxWidth: 280}}>
+        <p style={{fontSize: 12, color: "#0b565e", opacity: 0.6, maxWidth: 280}}>
           Nếu không thấy cửa sổ đăng nhập hiện ra, hãy nhấn nút <b>"Mở trong tab mới"</b> ở góc trên bên phải màn hình.
         </p>
       </div>
@@ -2659,7 +2840,7 @@ export default function App() {
 
   if (isLocked && passcode) {
     return (
-      <div style={{minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:"#4c1d95", color:"#fff", padding:20}}>
+      <div style={{minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:"linear-gradient(135deg, #82edc0, #7be0dc, #7fe7cd, #88e7c8)", color:"#0b565e", padding:20}}>
         <div style={{fontSize:48, marginBottom:20}}>🔒</div>
         <h2 style={{marginBottom:20}}>HappyShare Locked</h2>
         <Input 
@@ -2668,7 +2849,7 @@ export default function App() {
           value={enteredPass} 
           onChange={(e: any) => setEnteredPass(e.target.value)}
           onKeyDown={(e: any) => e.key === "Enter" && unlock()}
-          style={{maxWidth:300, textAlign:"center", fontSize:18, letterSpacing:4, color: "#1e1e2e"}}
+          style={{maxWidth:300, textAlign:"center", fontSize:18, letterSpacing:4, color: "#0b565e"}}
         />
         <Btn onClick={unlock} style={{marginTop:20, width:300}}>Mở khóa</Btn>
       </div>
@@ -2676,7 +2857,7 @@ export default function App() {
   }
 
   return (
-    <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",background:"linear-gradient(135deg,#4c1d95 0%,#7c3aed 40%,#a78bfa 100%)"}}>
+    <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",background:"linear-gradient(135deg, #82edc0, #7be0dc, #7fe7cd, #88e7c8)", color: "#0b565e"}}>
       {createdGroupParams && (
         <GroupSuccessModal 
           group={createdGroupParams.group} 
@@ -2701,11 +2882,11 @@ export default function App() {
         <Modal onClose={() => {}}>
           <div style={{ textAlign: "center", padding: "20px 0" }}>
             <div style={{ fontSize: 48, marginBottom: 16 }}>👋</div>
-            <div style={{ fontWeight: 900, fontSize: 20, marginBottom: 8, color: "#1e293b" }}>Chào mừng bạn!</div>
-            <div style={{ fontSize: 14, color: "#64748b", marginBottom: 24 }}>Vui lòng hoàn tất hồ sơ để bắt đầu sử dụng.</div>
+            <div style={{ fontWeight: 900, fontSize: 20, marginBottom: 8, color: "#0b565e" }}>Chào mừng bạn!</div>
+            <div style={{ fontSize: 14, color: "#2d666d", marginBottom: 24 }}>Vui lòng hoàn tất hồ sơ để bắt đầu sử dụng.</div>
             
             <div style={{ marginBottom: 20 }}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: "#475569", textAlign: "left", marginBottom: 6 }}>Tên hiển thị</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "#1a4d53", textAlign: "left", marginBottom: 6 }}>Tên hiển thị</div>
               <input 
                 placeholder="Nhập tên của bạn..." 
                 defaultValue={user?.displayName || ""} 
@@ -2715,7 +2896,42 @@ export default function App() {
             </div>
 
             <div style={{ marginBottom: 24 }}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: "#475569", textAlign: "left", marginBottom: 12 }}>Chọn Avatar</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "#1a4d53", textAlign: "left", marginBottom: 12 }}>Chọn Avatar</div>
+              
+              <div style={{ marginBottom: 15, textAlign: "center" }}>
+                <input 
+                  type="file" 
+                  id="onboarding-upload" 
+                  hidden 
+                  accept="image/*" 
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) {
+                      if (file.size > 500 * 1024) { alert("🚨 File quá lớn (tối đa 500KB)"); return; }
+                      const reader = new FileReader();
+                      reader.onloadend = () => {
+                        const base64 = reader.result as string;
+                        (window as any)._selectedAvatar = base64;
+                        // Clear emoji selection UI
+                        document.querySelectorAll('.av-choice').forEach(b => (b as HTMLElement).style.border = "2px solid #f1f5f9");
+                        // Preview
+                        const preview = document.getElementById("avatar-preview");
+                        if (preview) preview.innerHTML = `<img src="${base64}" style="width: 60px; height: 60px; border-radius: 50%; object-fit: cover; border: 3px solid #059669" />`;
+                      };
+                      reader.readAsDataURL(file);
+                    }
+                  }} 
+                />
+                <div id="avatar-preview" style={{ marginBottom: 10, display: "flex", justifyContent: "center" }}>
+                  <div style={{ width: 60, height: 60, borderRadius: "50%", background: "#f1f5f9", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32, border: "3px solid transparent" }}>
+                    ?
+                  </div>
+                </div>
+                <label htmlFor="onboarding-upload" style={{ display: "inline-block", background: "#ecfdf5", color: "#059669", padding: "8px 16px", borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: "pointer", border: "1.5px solid #059669" }}>
+                  📷 Tải ảnh lên
+                </label>
+              </div>
+
               <div style={{ display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "center" }}>
                 {["🐱", "🐶", "🦊", "🐻", "🐼", "🦁", "🐧", "🦄", "🐸", "🐰", "🐯", "🐨", "🐷", "🐵", "🐙", "🐢", "🐔", "🐦"].map(av => (
                   <button 
@@ -2724,8 +2940,11 @@ export default function App() {
                       const btns = document.querySelectorAll('.av-choice');
                       btns.forEach(b => (b as HTMLElement).style.border = "2px solid #f1f5f9");
                       const btn = document.getElementById(`av-${av}`);
-                      if (btn) btn.style.border = "2px solid #7c3aed";
+                      if (btn) btn.style.border = "2px solid #059669";
                       (window as any)._selectedAvatar = av;
+                      // Clear preview
+                      const preview = document.getElementById("avatar-preview");
+                      if (preview) preview.innerHTML = `<div style="width: 60px; height: 60px; border-radius: 50%; background: #fff; display: flex; align-items: center; justify-content: center; fontSize: 32; border: 3px solid #059669">${av}</div>`;
                     }}
                     id={`av-${av}`}
                     className="av-choice"
@@ -2754,16 +2973,16 @@ export default function App() {
       )}
 
       {/* HEADER */}
-      <div style={{padding:"20px 20px 15px", background: "rgba(0,0,0,0.15)", borderBottom: "1px solid rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "space-between"}}>
+      <div style={{padding:"20px 20px 15px", background: "rgba(255,255,255,0.2)", borderBottom: "1px solid rgba(11,86,94,0.1)", display: "flex", alignItems: "center", justifyContent: "space-between"}}>
         <div 
           onClick={() => setTab("settings")}
-          style={{cursor: "pointer", transition: "transform 0.2s", ":hover": {transform: "scale(1.05)"}} as any}
+          style={{cursor: "pointer", transition: "transform 0.2s"}}
         >
-          <Av name={profile?.name || "ME"} size={40} avatar={profilePic || profile?.avatar || ""} style={{ border: "2px solid #fff" }} />
+          <Av name={profile?.name || "ME"} size={40} avatar={profilePic || profile?.avatar || ""} style={{ border: "2px solid #0b565e" }} />
         </div>
         <div style={{textAlign: "center"}}>
-          <h1 style={{color:"#fff", fontSize:22, fontWeight:900, letterSpacing:-0.5, margin:0}}>✨ HappyShare</h1>
-          <p style={{color:"rgba(255,255,255,0.8)", fontSize:11, margin:"2px 0 0"}}>Dividing Joy, Not Just Bills</p>
+          <h1 style={{color:"#0b565e", fontSize:22, fontWeight:900, letterSpacing:-0.5, margin:0}}>✨ HappyShare</h1>
+          <p style={{color:"#1a4d53", fontSize:11, margin:"2px 0 0", fontWeight: 700}}>Dividing Joy, Not Just Bills</p>
         </div>
         <div style={{width: 40}} /> {/* Spacer for balance */}
       </div>
@@ -2773,7 +2992,7 @@ export default function App() {
           <GroupsListView groups={groups} friends={friends} onSelectGroup={selectGroup} onCreateGroup={createGroup}/>
         )}
         {tab==="active"&&activeGroup&&(
-          <GroupView group={groups.find(g=>g.id===activeGroup.id)||activeGroup} friends={friends} currentUserName={profile?.name || ""} onUpdate={updateGroup} onDelete={()=>deleteGroup(activeGroup)} onLeave={()=>leaveGroup(activeGroup)} onBack={() => setTab("groups")}/>
+          <GroupView group={groups.find(g=>g.id===activeGroup.id)||activeGroup} friends={friends} profile={profile} onUpdate={updateGroup} onDelete={()=>deleteGroup(activeGroup)} onLeave={()=>leaveGroup(activeGroup)} onBack={() => setTab("groups")}/>
         )}
         {tab==="friends"&&<FriendsView friends={friends} groups={groups} onAddFriend={addFriend} onRemoveFriend={removeFriend} onPayClick={(g) => selectGroup(g)}/>}
         {tab==="qr" && <ReceiptScannerView groups={groups} onAddExpense={addExpenseToGroup} />}
@@ -2781,12 +3000,12 @@ export default function App() {
           <div style={{padding:14}}>
             {/* Account Settings */}
             <Card>
-              <SecTitle icon="👤" title="Tài khoản" color="#7c3aed"/>
+              <SecTitle icon="👤" title="Tài khoản" color="#059669"/>
               <div style={{display:"flex", alignItems:"center", gap:12}}>
-                <Av name={profile?.name || "ME"} size={54} avatar={profilePic || profile?.avatar || ""} style={{ border: "2px solid #7c3aed" }} />
+                <Av name={profile?.name || "ME"} size={54} avatar={profilePic || profile?.avatar || ""} style={{ border: "2px solid #059669" }} />
                 <div style={{flex:1, overflow:"hidden"}}>
-                  <div style={{fontWeight:800, fontSize:16, color: "#1e1e2e", marginBottom: 2, whiteSpace:"nowrap", textOverflow:"ellipsis", overflow:"hidden"}}>{profile?.name || "Người dùng"}</div>
-                  <div style={{fontWeight:500, fontSize:12, color: "#64748b", whiteSpace:"nowrap", textOverflow:"ellipsis", overflow:"hidden"}}>{profile?.email || ""}</div>
+                  <div style={{fontWeight:800, fontSize:16, color: "#0b565e", marginBottom: 2, whiteSpace:"nowrap", textOverflow:"ellipsis", overflow:"hidden"}}>{profile?.name || "Người dùng"}</div>
+                  <div style={{fontWeight:500, fontSize:12, color: "#2d666d", whiteSpace:"nowrap", textOverflow:"ellipsis", overflow:"hidden"}}>{profile?.email || ""}</div>
                 </div>
                 <button onClick={() => setShowAvatarModal(true)} style={{background:"#f1f5f9", color:"#334155", padding:"8px 12px", borderRadius:8, fontSize:12, fontWeight:700, border:"none", cursor:"pointer", flexShrink:0}}>📷 Đổi ảnh</button>
               </div>
@@ -2794,7 +3013,7 @@ export default function App() {
 
             {/* Sở thích & Thông báo */}
             <Card>
-               <SecTitle icon="⚙️" title="Sở thích & Thông báo" color="#7c3aed"/>
+               <SecTitle icon="⚙️" title="Sở thích & Thông báo" color="#059669"/>
                
                <div style={{marginBottom:10}}>
                  <div 
@@ -2847,7 +3066,7 @@ export default function App() {
 
             {showSecurityModal && (
               <Modal onClose={() => setShowSecurityModal(false)}>
-                <SecTitle icon="🔒" title="Bảo mật" color="#7c3aed" />
+                <SecTitle icon="🔒" title="Bảo mật" color="#059669" />
                 <div style={{marginBottom: 20}}>
                   <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", background:"#f8fafc", padding:"12px 14px", borderRadius:12}}>
                     <div style={{flex:1}}>
@@ -2904,9 +3123,9 @@ export default function App() {
 
             {showAvatarModal && (
               <Modal onClose={() => setShowAvatarModal(false)}>
-                <SecTitle icon="🖼️" title="Đổi ảnh đại diện" color="#7c3aed" />
+                <SecTitle icon="🖼️" title="Đổi ảnh đại diện" color="#059669" />
                 <div style={{ marginBottom: 20 }}>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: "#475569", marginBottom: 12 }}>Chọn ảnh có sẵn:</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: "#1a4d53", marginBottom: 12 }}>Chọn ảnh có sẵn:</div>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "center", marginBottom: 20 }}>
                     {["🐱", "🐶", "🦊", "🐻", "🐼", "🦁", "🐧", "🦄", "🐸", "🐰", "🐯", "🐨", "🐷", "🐵", "🐙", "🐢", "🐔", "🐦"].map(av => (
                       <button 
@@ -2932,10 +3151,10 @@ export default function App() {
                       </button>
                     ))}
                   </div>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: "#475569", marginBottom: 12, textAlign: "center" }}>Hoặc tải ảnh từ thiết bị:</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: "#1a4d53", marginBottom: 12, textAlign: "center" }}>Hoặc tải ảnh từ thiết bị:</div>
                   <div style={{ textAlign: "center", marginBottom: 10 }}>
                     <input type="file" id="pfp-upload" hidden accept="image/*" onChange={(e) => { handlePicUpload(e); setShowAvatarModal(false); }} />
-                    <label htmlFor="pfp-upload" style={{display:"inline-block", background:"#ede9fe", color:"#7c3aed", padding:"12px 20px", borderRadius:12, fontSize:14, fontWeight:700, cursor:"pointer", border: "2px solid #c4b5fd"}}>📸 Chọn ảnh từ máy</label>
+                    <label htmlFor="pfp-upload" style={{display:"inline-block", background:"#ecfdf5", color:"#059669", padding:"12px 20px", borderRadius:12, fontSize:14, fontWeight:700, cursor:"pointer", border: "2px solid #6ee7b7"}}>📸 Chọn ảnh từ máy</label>
                   </div>
                 </div>
               </Modal>
@@ -2962,12 +3181,12 @@ export default function App() {
         )}
       </div>
 
-      <div style={{position:"fixed",bottom:12,left:12,right:12,background:"rgba(255,255,255,0.9)", backdropFilter:"blur(10px)",borderRadius:20,display:"flex",padding:"8px 4px",boxShadow:"0 8px 32px rgba(124,58,237,0.15)",zIndex:1000, border:"1px solid rgba(255,255,255,0.5)"}}>
+      <div style={{position:"fixed",bottom:12,left:12,right:12,background:"rgba(255,255,255,0.9)", backdropFilter:"blur(10px)",borderRadius:20,display:"flex",padding:"8px 4px",boxShadow:"0 8px 32px rgba(11,86,94,0.15)",zIndex:1000, border:"1px solid rgba(255,255,255,0.5)"}}>
         {tabs.map(t=>(
           <button key={t.id} onClick={()=>setTab(t.id)} style={{flex:1,padding:"4px 0",border:"none",background:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:2, position:"relative"}}>
-            <div style={{fontSize:18, height: 24, display: "flex", alignItems: "center", justifyContent: "center", color:(tab===t.id || (t.id==="groups" && tab==="active"))?"#7c3aed":"#94a3b8", transform: (tab===t.id || (t.id==="groups" && tab==="active")) ? "translateY(-1px)" : "none", transition: "0.2s"}}>{t.icon}</div>
-            <span style={{fontSize:9,color:(tab===t.id || (t.id==="groups" && tab==="active"))?"#7c3aed":"#94a3b8", fontWeight:700, letterSpacing:0.3, opacity: (tab===t.id || (t.id==="groups" && tab==="active")) ? 1 : 0.6}}>{t.label}</span>
-            {(tab===t.id || (t.id==="groups" && tab==="active")) && <div style={{position:"absolute", bottom:-2, width:4, height:4, borderRadius:"50%", background:"#7c3aed"}} />}
+            <div style={{fontSize:18, height: 24, display: "flex", alignItems: "center", justifyContent: "center", color:(tab===t.id || (t.id==="groups" && tab==="active"))?"#0b565e":"#2d666d", transform: (tab===t.id || (t.id==="groups" && tab==="active")) ? "translateY(-1px)" : "none", transition: "0.2s"}}>{t.icon}</div>
+            <span style={{fontSize:9,color:(tab===t.id || (t.id==="groups" && tab==="active"))?"#0b565e":"#2d666d", fontWeight:700, letterSpacing:0.3, opacity: (tab===t.id || (t.id==="groups" && tab==="active")) ? 1 : 0.6}}>{t.label}</span>
+            {(tab===t.id || (t.id==="groups" && tab==="active")) && <div style={{position:"absolute", bottom:-2, width:4, height:4, borderRadius:"50%", background:"#0b565e"}} />}
           </button>
         ))}
       </div>

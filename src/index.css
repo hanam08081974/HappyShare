@@ -10,5 +10,9 @@
   html, body {
     font-family: var(--font-sans);
     font-feature-settings: "tnum" 1, "lnum" 1;
+    background: linear-gradient(135deg, #82edc0, #7be0dc, #7fe7cd, #88e7c8);
+    background-attachment: fixed;
+    min-height: 100vh;
+    color: #0b565e;
   }
 }
