@@ -919,13 +919,12 @@ function PayModal({ members, memberAvatars, transactions, onPay, onClose }: { me
   );
 }
 
-function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClose, onUpdate, onLeave, onDelete }: { group: Group, friends: Friend[], currentUser: string, memberAvatars?: Record<string, string>, onClose: () => void, onUpdate: (g: Group) => void, onLeave: () => void, onDelete: () => void }) {
+function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClose, onUpdate, onLeave, onDelete, sendInviteEmail }: { group: Group, friends: Friend[], currentUser: string, memberAvatars?: Record<string, string>, onClose: () => void, onUpdate: (g: Group) => void, onLeave: () => void, onDelete: () => void, sendInviteEmail: (email: string, inviterName: string, groupName?: string, inviteCode?: string) => Promise<boolean> }) {
   const [newMemberName, setNewMemberName] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
-  const [sendingEmail, setSendingEmail] = useState(false);
+  const [sendingInvite, setSendingInvite] = useState(false);
   const isLeader = group.leaderUid ? group.leaderUid === auth.currentUser?.uid : group.leader === currentUser;
   const [copiedCode, setCopiedCode] = useState(false);
-  const [showQR, setShowQR] = useState(false);
 
   const inviteLink = `${window.location.origin}/?joinCode=${group.inviteCode}`;
 
@@ -935,32 +934,21 @@ function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClos
     setTimeout(() => setCopiedCode(false), 2000);
   };
 
-  const sendInviteEmail = async () => {
-    if (!inviteEmail.trim() || !inviteEmail.includes('@')) {
+  const handleSendInvite = async () => {
+    if (!inviteEmail.trim() || sendingInvite) return;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(inviteEmail.trim())) {
       alert("Email không hợp lệ!");
       return;
     }
-    setSendingEmail(true);
-    try {
-      const res = await fetch("/api/invite", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          email: inviteEmail.trim(),
-          inviterName: currentUser,
-          groupName: group.emoji + " " + group.name,
-          inviteLink: inviteLink
-        })
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Có lỗi xảy ra");
-      alert("Gửi email thành công!");
+    setSendingInvite(true);
+    const success = await sendInviteEmail(inviteEmail.trim(), currentUser, group.name, group.inviteCode);
+    if (success) {
+      alert("📧 Đã gửi lời mời tới " + inviteEmail);
       setInviteEmail("");
-    } catch (err: any) {
-      alert("Lỗi khi gửi email: " + err.message);
-    } finally {
-      setSendingEmail(false);
+    } else {
+      alert("❌ Gửi lời mời thất bại. Kiểm tra SMTP.");
     }
+    setSendingInvite(false);
   };
 
   const addMember = () => {
@@ -998,21 +986,23 @@ function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClos
       <div style={{fontWeight:800,fontSize:16,marginBottom:16,color:"#1e1e2e"}}>⚙️ Cài đặt nhóm</div>
 
       <Card style={{background:"#f5f3ff",marginBottom:10}}>
-        <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12}}>
-          <SecTitle icon="🔗" title="Link mời bạn bè" color="#059669" />
-          <button onClick={() => setShowQR(!showQR)} style={{background: showQR ? "#059669" : "#ecfdf5", color: showQR ? "#fff" : "#059669", border: "none", borderRadius: 8, padding: "5px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer"}}>QR Code</button>
-        </div>
+        <SecTitle icon="🔗" title="Link mời bạn bè" color="#059669" />
         
-        {showQR ? (
-          <div style={{display: "flex", justifyContent: "center", background: "#fff", padding: 10, borderRadius: 12}}>
-             <QRCode value={inviteLink} size={150} level="Q" />
-          </div>
-        ) : (
-          <div style={{display:"flex",alignItems:"center",gap:8}}>
-            <div style={{flex:1,background:"#ecfdf5",borderRadius:9,padding:"10px 14px",fontWeight:800,fontSize:14,color:"#059669",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{inviteLink}</div>
-            <button onClick={copyCode} style={{background:copiedCode?"#059669":"#059669",color:"#fff",border:"none",borderRadius:9,padding:"10px 14px",fontWeight:700,fontSize:12,cursor:"pointer"}}>{copiedCode?"✅ Đã copy":"📋 Copy"}</button>
-          </div>
-        )}
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+          <div style={{flex:1,background:"#ecfdf5",borderRadius:9,padding:"10px 14px",fontWeight:800,fontSize:14,color:"#059669",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{inviteLink}</div>
+          <button onClick={copyCode} style={{background:copiedCode?"#059669":"#059669",color:"#fff",border:"none",borderRadius:9,padding:"10px 14px",fontWeight:700,fontSize:12,cursor:"pointer"}}>{copiedCode?"✅":"📋"}</button>
+        </div>
+
+        <div style={{fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8}}>GỬI QUA EMAIL</div>
+        <div style={{display: "flex", gap: 8, marginBottom: 15}}>
+          <Input placeholder="Email bạn bè..." value={inviteEmail} onChange={(e: any) => setInviteEmail(e.target.value)} style={{fontSize: 13, flex: 1}} />
+          <Btn onClick={handleSendInvite} disabled={sendingInvite} style={{fontSize: 13, whiteSpace: "nowrap"}}>{sendingInvite ? "Đang gửi..." : "Mời 📧"}</Btn>
+        </div>
+
+        <div style={{fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8}}>MÃ QR VÀO NHÓM</div>
+        <div style={{display: "flex", justifyContent: "center", background: "#fff", padding: 15, borderRadius: 12, border: "2px solid #ecfdf5"}}>
+           <QRCode value={inviteLink} size={150} level="Q" />
+        </div>
       </Card>
 
       <Card style={{marginBottom:10}}>
@@ -1046,12 +1036,6 @@ function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClos
             </div>
           ))}
           {friends.length === 0 && <div style={{ fontSize: 11, color: "#94a3b8", textAlign: "center", width: "100%" }}>Chưa có bạn bè để thêm.</div>}
-        </div>
-
-        <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>MỜI QUA EMAIL</div>
-        <div style={{ display: "flex", gap: 8, marginBottom: 15 }}>
-          <Input placeholder="Nhập địa chỉ email..." value={inviteEmail} onChange={(e: any) => setInviteEmail(e.target.value)} style={{ fontSize: 13, flex: 1 }} />
-          <Btn onClick={sendInviteEmail} style={{ fontSize: 13 }} disabled={sendingEmail}>{sendingEmail ? "Đang gửi..." : "Gửi Email"}</Btn>
         </div>
 
         <div style={{ fontWeight: 700, fontSize: 12, color: "#64748b", marginBottom: 8 }}>THÊM THÀNH VIÊN (Nhập tên)</div>
@@ -1578,7 +1562,7 @@ function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddEx
   );
 }
 
-function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBack }: { group: Group, friends: Friend[], profile: UserProfile | null, onUpdate: (g: Group) => void, onDelete: () => void, onLeave: () => void, onBack: () => void }) {
+function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBack, sendInviteEmail }: { group: Group, friends: Friend[], profile: UserProfile | null, onUpdate: (g: Group) => void, onDelete: () => void, onLeave: () => void, onBack: () => void, sendInviteEmail: (email: string, inviterName: string, groupName?: string, inviteCode?: string) => Promise<boolean> }) {
   const [subTab,setSubTab]=useState("home");
   const [selectedBill,setSelectedBill]=useState<Expense | null>(null);
   const [showAddExp,setShowAddExp]=useState(false);
@@ -1731,7 +1715,7 @@ function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBac
       )}
       {showAddExp&&<AddExpenseModal members={members} memberAvatars={memberAvatars} onAdd={addExpense} onClose={()=>setShowAddExp(false)}/>}
       {showPay&&<PayModal members={members} memberAvatars={memberAvatars} transactions={transactions} onPay={addPayment} onClose={()=>setShowPay(false)}/>}
-      {showSettings&&<GroupSettingsModal group={group} friends={friends} currentUser={auth.currentUser?.displayName || ""} memberAvatars={memberAvatars} onClose={()=>setShowSettings(false)} onUpdate={onUpdate} onLeave={onLeave} onDelete={onDelete}/>}
+      {showSettings&&<GroupSettingsModal group={group} friends={friends} currentUser={auth.currentUser?.displayName || ""} memberAvatars={memberAvatars} onClose={()=>setShowSettings(false)} onUpdate={onUpdate} onLeave={onLeave} onDelete={onDelete} sendInviteEmail={sendInviteEmail}/>}
 
       <div style={{background:"linear-gradient(135deg, #0b565e, #147f87)",padding:"12px 16px 0",flexShrink:0}}>
         <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
@@ -2626,6 +2610,35 @@ export default function App() {
     }
   };
 
+  const sendInviteEmail = async (email: string, inviterName: string, groupName?: string, inviteCode?: string) => {
+    try {
+      const inviteLink = inviteCode 
+        ? `${window.location.origin}/?joinCode=${inviteCode}`
+        : `${window.location.origin}`;
+        
+      const response = await fetch("/api/invite", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email,
+          inviterName,
+          groupName: groupName || "HappyShare",
+          inviteLink
+        }),
+      });
+      
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to send email");
+      }
+      return true;
+    } catch (err) {
+      console.error("Email send error:", err);
+      // alert("Không thể gửi email: " + (err instanceof Error ? err.message : String(err)));
+      return false;
+    }
+  };
+
   const addFriend = async (f: Friend) => {
     if (!user || !profile) return;
     if (f.email === user.email) {
@@ -2635,8 +2648,13 @@ export default function App() {
     try {
       await addDoc(collection(db, "users", user.uid, "friends"), f);
       if (f.email) {
-        console.log(`[FRIEND INVITE SIMULATION] To: ${f.email} | Body: ${profile.name} invited you to join HappyShare!`);
-        // In a real app, send actual email here
+        console.log(`[FRIEND INVITE] Sending actual email to: ${f.email}`);
+        const success = await sendInviteEmail(f.email, profile.name);
+        if (success) {
+          console.log("Email sent successfully");
+        } else {
+          alert("Lời mời đã được lưu, nhưng email không gửi được. Hãy kiểm tra cấu hình SMTP.");
+        }
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, "friends");
@@ -3026,7 +3044,7 @@ export default function App() {
           <GroupsListView groups={groups} friends={friends} onSelectGroup={selectGroup} onCreateGroup={createGroup}/>
         )}
         {tab==="active"&&activeGroup&&(
-          <GroupView group={groups.find(g=>g.id===activeGroup.id)||activeGroup} friends={friends} profile={profile} onUpdate={updateGroup} onDelete={()=>deleteGroup(activeGroup)} onLeave={()=>leaveGroup(activeGroup)} onBack={() => setTab("groups")}/>
+          <GroupView group={groups.find(g=>g.id===activeGroup.id)||activeGroup} friends={friends} profile={profile} onUpdate={updateGroup} onDelete={()=>deleteGroup(activeGroup)} onLeave={()=>leaveGroup(activeGroup)} onBack={() => setTab("groups")} sendInviteEmail={sendInviteEmail}/>
         )}
         {tab==="friends"&&<FriendsView friends={friends} groups={groups} onAddFriend={addFriend} onRemoveFriend={removeFriend} onPayClick={(g) => selectGroup(g)}/>}
         {tab==="qr" && <ReceiptScannerView groups={groups} onAddExpense={addExpenseToGroup} />}
