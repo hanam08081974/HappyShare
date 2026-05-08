@@ -780,10 +780,8 @@ function AddExpenseModal({ members, memberDetails, onAdd, onClose }: { members: 
                         const val = parseNum(e.target.value);
                         setSplits(s => ({ ...s, [m]: val }));
                       }} 
-                      placeholder="0" 
-                      style={{ width: 80, border: "2px solid #e2e8f0", borderRadius: 8, padding: "5px 7px", fontSize: 13, outline: "none", textAlign: "right" }} 
-                    />
-                  </div>
+                      placeholder="0" />
+                    </div>
                 ))}
               </>
             )}
@@ -800,13 +798,50 @@ function PayModal({ members, memberDetails, transactions, onPay, onClose }: { me
   const [to,setTo]=useState(transactions[0]?.to||"");
   const [amount,setAmount]=useState(transactions[0]?Math.round(transactions[0].amount):"");
   const [note,setNote]=useState("");
+  const [paymentMethod, setPaymentMethod] = useState<'cash' | 'ewallet'>('cash');
+  const [simulationStep, setSimulationStep] = useState<'none' | 'processing' | 'success'>('none');
   const suggested = transactions.find(t=>t.from===from&&t.to===to);
+
   const handlePay = (overrideAmt?: number) => {
     const amt = overrideAmt !== undefined ? overrideAmt : Math.round(parseFloat(amount as string));
     if(!from||!to||from===to||isNaN(amt)||amt<=0) return;
+    
+    if (paymentMethod === 'ewallet') {
+      setSimulationStep('processing');
+      setTimeout(() => {
+        setSimulationStep('success');
+        setTimeout(() => {
+          onPay({id: String(Date.now()), from,to,amount:amt,note:note.trim() + " (Chuyển khoản)",ts:Date.now()});
+          onClose();
+        }, 1500);
+      }, 2000);
+      return;
+    }
+
     onPay({id: String(Date.now()), from,to,amount:amt,note:note.trim(),ts:Date.now()});
     onClose();
   };
+
+  if (simulationStep !== 'none') {
+    return (
+      <Modal onClose={() => {}}>
+        <div style={{ padding: "40px", textAlign: "center" }}>
+          {simulationStep === 'processing' ? (
+            <>
+              <div style={{ fontSize: 60, marginBottom: 20 }}>🔄</div>
+              <div style={{ fontSize: 18, fontWeight: 800, color: "#1e1e2e" }}>Đang chuyển khoản...</div>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: 60, marginBottom: 20 }}>✅</div>
+              <div style={{ fontSize: 18, fontWeight: 800, color: "#059669" }}>Chuyển khoản thành công!</div>
+            </>
+          )}
+        </div>
+      </Modal>
+    );
+  }
+
   return (
     <Modal onClose={onClose}>
       <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
@@ -843,6 +878,13 @@ function PayModal({ members, memberDetails, transactions, onPay, onClose }: { me
         style={{marginBottom:8}}
       />
       <Input placeholder="Ghi chú (tuỳ chọn)" value={note} onChange={(e: any)=>setNote(e.target.value)} style={{marginBottom:12}}/>
+      
+      <div style={{fontSize:11,fontWeight:700,color:"#64748b",textTransform:"uppercase",marginBottom:6}}>Phương thức thanh toán</div>
+      <div style={{display:"flex",background:"#f1f5f9",borderRadius:10,padding:3,gap:2,marginBottom:16}}>
+        <div onClick={() => setPaymentMethod('cash')} style={{flex:1,padding:"7px 4px",borderRadius:8,background:paymentMethod==='cash'?"#7c3aed":"transparent",color:paymentMethod==='cash'?"#fff":"#64748b",textAlign:"center",fontWeight:700,fontSize:12,cursor:"pointer"}}>💵 Tiền mặt</div>
+        <div onClick={() => setPaymentMethod('ewallet')} style={{flex:1,padding:"7px 4px",borderRadius:8,background:paymentMethod==='ewallet'?"#7c3aed":"transparent",color:paymentMethod==='ewallet'?"#fff":"#64748b",textAlign:"center",fontWeight:700,fontSize:12,cursor:"pointer"}}>📱 Ví điện tử</div>
+      </div>
+
       <Btn onClick={() => handlePay()} color="linear-gradient(135deg,#059669,#34d399)" style={{width:"100%"}}>✅ Xác nhận thanh toán</Btn>
     </Modal>
   );
@@ -893,13 +935,23 @@ function GroupSettingsModal({ group, friends, currentUser, onClose, onUpdate, on
   return (
     <Modal onClose={onClose}>
       <div style={{fontWeight:800,fontSize:16,marginBottom:16,color:"#1e1e2e"}}>⚙️ Cài đặt nhóm</div>
-      
+
       <Card style={{background:"#f5f3ff",marginBottom:10}}>
-        <SecTitle icon="🔗" title="Link mời bạn bè" color="#7c3aed"/>
-        <div style={{display:"flex",alignItems:"center",gap:8}}>
-          <div style={{flex:1,background:"#ede9fe",borderRadius:9,padding:"10px 14px",fontWeight:800,fontSize:14,color:"#7c3aed",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{`${window.location.origin}/?joinCode=${group.inviteCode}`}</div>
-          <button onClick={copyCode} style={{background:copiedCode?"#059669":"#7c3aed",color:"#fff",border:"none",borderRadius:9,padding:"10px 14px",fontWeight:700,fontSize:12,cursor:"pointer"}}>{copiedCode?"✅ Đã copy":"📋 Copy"}</button>
+        <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12}}>
+          <SecTitle icon="🔗" title="Link mời bạn bè" color="#7c3aed" />
+          <button onClick={() => setShowQR(!showQR)} style={{background: showQR ? "#7c3aed" : "#ede9fe", color: showQR ? "#fff" : "#7c3aed", border: "none", borderRadius: 8, padding: "5px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer"}}>QR Code</button>
         </div>
+        
+        {showQR ? (
+          <div style={{display: "flex", justifyContent: "center", background: "#fff", padding: 10, borderRadius: 12}}>
+             <QRCode value={inviteLink} size={150} level="Q" />
+          </div>
+        ) : (
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <div style={{flex:1,background:"#ede9fe",borderRadius:9,padding:"10px 14px",fontWeight:800,fontSize:14,color:"#7c3aed",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{inviteLink}</div>
+            <button onClick={copyCode} style={{background:copiedCode?"#059669":"#7c3aed",color:"#fff",border:"none",borderRadius:9,padding:"10px 14px",fontWeight:700,fontSize:12,cursor:"pointer"}}>{copiedCode?"✅ Đã copy":"📋 Copy"}</button>
+          </div>
+        )}
       </Card>
 
       <Card style={{marginBottom:10}}>
