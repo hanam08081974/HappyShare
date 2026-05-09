@@ -84,6 +84,54 @@ app.post("/api/invite", async (req, res) => {
   }
 });
 
+// AI Receipt Scanner Endpoint
+app.post("/api/scan-receipt", async (req, res) => {
+  const { imageBase64, mimeType } = req.body;
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    return res.status(503).json({ error: "GEMINI_API_KEY is not configured on the server." });
+  }
+
+  if (!imageBase64 || !mimeType) {
+    return res.status(400).json({ error: "Missing imageBase64 or mimeType" });
+  }
+
+  try {
+    const { GoogleGenAI, Type } = await import("@google/genai");
+    const genAI = new GoogleGenAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+    const prompt = "Extract receipt items and prices. Return a JSON array of objects. Format: [{ name: 'item name', price: 1000 }]. No markdown, just JSON.";
+
+    const result = await model.generateContent([
+      prompt,
+      {
+        inlineData: {
+          data: imageBase64,
+          mimeType: mimeType
+        }
+      }
+    ]);
+
+    const response = await result.response;
+    let text = response.text();
+    
+    // Clean up markdown if AI returned it
+    if (text.startsWith("```json")) {
+      text = text.replace(/```json\n?/, "").replace(/\n?```/, "");
+    } else if (text.startsWith("```")) {
+       text = text.replace(/```\n?/, "").replace(/\n?```/, "");
+    }
+
+    const parsed = JSON.parse(text);
+    res.json(parsed);
+  } catch (err) {
+    console.error("AI scanning error:", err);
+    res.status(500).json({ error: "Failed to scan receipt via AI." });
+  }
+});
+
 async function startServer() {
   const PORT = 3000;
 

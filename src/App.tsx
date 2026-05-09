@@ -4,12 +4,8 @@ import { QrCode, Receipt, Upload, Loader2, ImagePlus, Camera, LogOut } from "luc
 import { initializeApp } from "firebase/app";
 import { getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signOut, User as FirebaseUser, reauthenticateWithPopup } from "firebase/auth";
 import { getFirestore, initializeFirestore, collection, doc, setDoc, getDoc, getDocs, onSnapshot, query, where, addDoc, updateDoc, deleteDoc, serverTimestamp, getDocFromServer, orderBy, collectionGroup } from "firebase/firestore";
-import { GoogleGenAI, Type } from "@google/genai";
 import firebaseConfig from "../firebase-applet-config.json";
 import QRCode from "react-qr-code";
-
-// Initialize AI
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
@@ -566,35 +562,35 @@ function AddExpenseModal({ members, memberAvatars, onAdd, onClose, currency = "�
         const base64Data = imageStr.split(",")[1];
         const mimeType = imageStr.substring(imageStr.indexOf(":")+1, imageStr.indexOf(";"));
         
-        const response = await ai.models.generateContent({
-          model: "gemini-3.1-pro-preview",
-          contents: {
-            parts: [
-              { inlineData: { data: base64Data, mimeType } },
-              { text: "Extract receipt items and prices. Return a JSON array of objects. Format: [{ name: 'item name', price: 1000 }]. No markdown, just JSON." }
-            ]
-          },
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.ARRAY,
-              items: { type: Type.OBJECT, properties: { name: { type: Type.STRING }, price: { type: Type.NUMBER } } }
-            }
+        try {
+          const response = await fetch("/api/scan-receipt", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ imageBase64: base64Data, mimeType })
+          });
+
+          if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error || "Failed to scan receipt");
           }
-        });
-        
-        const parsed = JSON.parse(response.text || "[]");
-        const list = parsed.map((p: any) => ({ ...p, assignedTo: [] }));
-        setItems(list);
-        setMode("itemized");
-        const tot = list.reduce((s:number,it:any)=>s+(it.price||0), 0);
-        setAmount(tot.toString());
-        if (!desc.trim()) setDesc("Hóa đơn");
-        setIsScanning(false);
+
+          const parsed = await response.json();
+          const list = parsed.map((p: any) => ({ ...p, assignedTo: [] }));
+          setItems(list);
+          setMode("itemized");
+          const tot = list.reduce((s:number,it:any)=>s+(it.price||0), 0);
+          setAmount(tot.toString());
+          if (!desc.trim()) setDesc("Hóa đơn");
+        } catch (innerErr) {
+          console.error(innerErr);
+          alert("Quét hoá đơn thất bại. " + (innerErr instanceof Error ? innerErr.message : ""));
+        } finally {
+          setIsScanning(false);
+        }
       };
     } catch(err) {
       console.error(err);
-      alert("Quét hoá đơn thất bại.");
+      alert("Có lỗi xảy ra khi đọc tệp.");
       setIsScanning(false);
     }
   };
@@ -707,7 +703,9 @@ function AddExpenseModal({ members, memberAvatars, onAdd, onClose, currency = "�
               return (
                 <div key={i} onClick={() => setPayers({ [m]: amt })} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, cursor: "pointer", padding: "4px 8px", borderRadius: 10, background: isSelected ? "#fff" : "transparent", boxShadow: isSelected ? "0 2px 8px rgba(0,0,0,0.05)" : "none", transition: "all 0.2s" }}>
                   <Av name={m} size={30} ci={i} avatar={memberAvatars?.[m]} />
-                  <span style={{ fontSize: 13, fontWeight: isSelected ? 700 : 600, color: isSelected ? "#1e293b" : "#64748b", flex: 1 }}>{m}</span>
+                  <span style={{ fontSize: 13, fontWeight: isSelected ? 700 : 600, color: isSelected ? "#1e293b" : "#64748b", flex: 1 }}>
+                    {m}{isSelected && <span style={{fontSize: 11, fontWeight: 500, color: "#059669", marginLeft: 4}}>(trả)</span>}
+                  </span>
                   {isSelected && (
                     <div style={{ background: isFull ? "#f0fdf4" : "#f1f5f9", color: isFull ? "#16a34a" : "#64748b", fontSize: 10, fontWeight: 800, padding: "3px 8px", borderRadius: 6 }}>
                       {isFull ? "ĐÃ TRẢ" : "GÓP TRẢ"}
@@ -1309,37 +1307,24 @@ function ReceiptScannerView({ groups, onAddExpense, currency = "đ" }: { groups:
       const base64Data = imageStr.split(",")[1];
       const mimeType = imageStr.substring(imageStr.indexOf(":")+1, imageStr.indexOf(";"));
       
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-pro-preview",
-        contents: {
-          parts: [
-            { inlineData: { data: base64Data, mimeType } },
-            { text: "Extract receipt items and prices. Return a JSON array of objects. Format: [{ name: 'item name', price: 1000 }]. No markdown, just JSON." }
-          ]
-        },
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                name: { type: Type.STRING },
-                price: { type: Type.NUMBER }
-              }
-            }
-          }
-        }
+      const response = await fetch("/api/scan-receipt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: base64Data, mimeType })
       });
-      
-      const text = response.text || "[]";
-      const parsed = JSON.parse(text);
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || "Failed to scan receipt");
+      }
+
+      const parsed = await response.json();
       setItems(parsed.map((p: any) => ({ ...p, assignedTo: [] })));
       if (members.length > 0) setPayers({ [members[0]]: parsed.reduce((s:number,it:any)=>s+(it.price||0), 0) });
       setStep(3);
     } catch(err) {
       console.error(err);
-      alert("Oops! Quét hoá đơn thất bại.");
+      alert("Oops! Quét hoá đơn thất bại. " + (err instanceof Error ? err.message : ""));
     } finally {
       setIsScanning(false);
     }
@@ -1530,6 +1515,26 @@ function ReceiptScannerView({ groups, onAddExpense, currency = "đ" }: { groups:
               >
                 🤝 Cả nhóm cùng trả
               </button>
+            </div>
+            
+            <div style={{ background: "#f8fafc", borderRadius: 12, padding: "10px 12px" }}>
+              {members.map((m, i) => {
+                const isSelected = (payers[m] || 0) > 0;
+                const isFull = Math.abs((payers[m] || 0) - total) < 0.1 && total > 0;
+                return (
+                  <div key={i} onClick={() => setPayers({ [m]: total })} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, cursor: "pointer", padding: "4px 8px", borderRadius: 10, background: isSelected ? "#fff" : "transparent", boxShadow: isSelected ? "0 2px 8px rgba(0,0,0,0.05)" : "none", transition: "all 0.2s" }}>
+                    <Av name={m} size={30} ci={i} avatar={group?.memberDetails?.[m]?.avatar} />
+                    <span style={{ fontSize: 13, fontWeight: isSelected ? 700 : 600, color: isSelected ? "#1e293b" : "#64748b", flex: 1 }}>
+                      {m}{isSelected && <span style={{fontSize: 11, fontWeight: 500, color: "#ec4899", marginLeft: 4}}>(trả)</span>}
+                    </span>
+                    {isSelected && (
+                      <div style={{ background: isFull ? "#fdf2f8" : "#f1f5f9", color: isFull ? "#ec4899" : "#64748b", fontSize: 10, fontWeight: 800, padding: "3px 8px", borderRadius: 6 }}>
+                        {isFull ? "ĐÃ TRẢ" : "GÓP TRẢ"}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </Card>
 
