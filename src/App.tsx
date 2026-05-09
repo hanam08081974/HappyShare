@@ -4,8 +4,12 @@ import { QrCode, Receipt, Upload, Loader2, ImagePlus, Camera, LogOut } from "luc
 import { initializeApp } from "firebase/app";
 import { getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signOut, User as FirebaseUser, reauthenticateWithPopup } from "firebase/auth";
 import { getFirestore, initializeFirestore, collection, doc, setDoc, getDoc, getDocs, onSnapshot, query, where, addDoc, updateDoc, deleteDoc, serverTimestamp, getDocFromServer, orderBy, collectionGroup } from "firebase/firestore";
+import { GoogleGenAI, Type } from "@google/genai";
 import firebaseConfig from "../firebase-applet-config.json";
 import QRCode from "react-qr-code";
+
+// Initialize AI
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
@@ -562,35 +566,35 @@ function AddExpenseModal({ members, memberAvatars, onAdd, onClose, currency = "�
         const base64Data = imageStr.split(",")[1];
         const mimeType = imageStr.substring(imageStr.indexOf(":")+1, imageStr.indexOf(";"));
         
-        try {
-          const response = await fetch("/api/scan-receipt", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ imageBase64: base64Data, mimeType })
-          });
-
-          if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(errorData.error || "Failed to scan receipt");
+        const response = await ai.models.generateContent({
+          model: "gemini-3.1-pro-preview",
+          contents: {
+            parts: [
+              { inlineData: { data: base64Data, mimeType } },
+              { text: "Extract receipt items and prices. Return a JSON array of objects. Format: [{ name: 'item name', price: 1000 }]. No markdown, just JSON." }
+            ]
+          },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.ARRAY,
+              items: { type: Type.OBJECT, properties: { name: { type: Type.STRING }, price: { type: Type.NUMBER } } }
+            }
           }
-
-          const parsed = await response.json();
-          const list = parsed.map((p: any) => ({ ...p, assignedTo: [] }));
-          setItems(list);
-          setMode("itemized");
-          const tot = list.reduce((s:number,it:any)=>s+(it.price||0), 0);
-          setAmount(tot.toString());
-          if (!desc.trim()) setDesc("Hóa đơn");
-        } catch (innerErr) {
-          console.error(innerErr);
-          alert("Quét hoá đơn thất bại. " + (innerErr instanceof Error ? innerErr.message : ""));
-        } finally {
-          setIsScanning(false);
-        }
+        });
+        
+        const parsed = JSON.parse(response.text || "[]");
+        const list = parsed.map((p: any) => ({ ...p, assignedTo: [] }));
+        setItems(list);
+        setMode("itemized");
+        const tot = list.reduce((s:number,it:any)=>s+(it.price||0), 0);
+        setAmount(tot.toString());
+        if (!desc.trim()) setDesc("Hóa đơn");
+        setIsScanning(false);
       };
     } catch(err) {
       console.error(err);
-      alert("Có lỗi xảy ra khi đọc tệp.");
+      alert("Quét hoá đơn thất bại.");
       setIsScanning(false);
     }
   };
@@ -1307,24 +1311,37 @@ function ReceiptScannerView({ groups, onAddExpense, currency = "đ" }: { groups:
       const base64Data = imageStr.split(",")[1];
       const mimeType = imageStr.substring(imageStr.indexOf(":")+1, imageStr.indexOf(";"));
       
-      const response = await fetch("/api/scan-receipt", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageBase64: base64Data, mimeType })
+      const response = await ai.models.generateContent({
+        model: "gemini-3.1-pro-preview",
+        contents: {
+          parts: [
+            { inlineData: { data: base64Data, mimeType } },
+            { text: "Extract receipt items and prices. Return a JSON array of objects. Format: [{ name: 'item name', price: 1000 }]. No markdown, just JSON." }
+          ]
+        },
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                name: { type: Type.STRING },
+                price: { type: Type.NUMBER }
+              }
+            }
+          }
+        }
       });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || "Failed to scan receipt");
-      }
-
-      const parsed = await response.json();
+      
+      const text = response.text || "[]";
+      const parsed = JSON.parse(text);
       setItems(parsed.map((p: any) => ({ ...p, assignedTo: [] })));
       if (members.length > 0) setPayers({ [members[0]]: parsed.reduce((s:number,it:any)=>s+(it.price||0), 0) });
       setStep(3);
     } catch(err) {
       console.error(err);
-      alert("Oops! Quét hoá đơn thất bại. " + (err instanceof Error ? err.message : ""));
+      alert("Oops! Quét hoá đơn thất bại.");
     } finally {
       setIsScanning(false);
     }
