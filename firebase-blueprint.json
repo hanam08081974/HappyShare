@@ -9,6 +9,7 @@
         "name": { "type": "string" },
         "email": { "type": "string" },
         "photoURL": { "type": "string" },
+        "currency": { "type": "string" },
         "createdAt": { "type": "string", "format": "date-time" },
         "prefs": {
           "type": "object",
@@ -105,12 +106,31 @@
         "name": { "type": "string" }
       },
       "required": ["type", "text", "ts"]
+    },
+    "GroupInvitation": {
+      "title": "GroupInvitation",
+      "description": "Information about a group invitation sent to a user",
+      "type": "object",
+      "properties": {
+        "groupId": { "type": "string" },
+        "groupName": { "type": "string" },
+        "inviterName": { "type": "string" },
+        "inviteCode": { "type": "string" },
+        "email": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "accepted", "declined"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["groupId", "groupName", "inviterName", "inviteCode", "email", "status", "createdAt"]
     }
   },
   "firestore": {
     "/users/{userId}": {
       "schema": "User",
       "description": "User profile"
+    },
+    "/groupInvitations/{invitationId}": {
+      "schema": "GroupInvitation",
+      "description": "Group invitations sent to users"
     },
     "/users/{userId}/friends/{friendId}": {
       "schema": "Friend",

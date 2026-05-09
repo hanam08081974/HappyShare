@@ -80,16 +80,17 @@ async function testConnection() {
 // ─── Constants ───────────────────────────────────────────────
 const COLORS = ["#059669","#2563EB","#DB2777","#D97706","#059669","#DC2626","#0891B2","#059669","#EA580C","#0D9488"];
 const EMOJIS = ["🏖️","🍜","🎉","✈️","🏠","🎮","🛒","🍻","🏕️","💼"];
-const fmt = (n: number) => {
+const fmt = (n: number, symbol: string = "đ") => {
   const rounded = Math.round(n);
-  return new Intl.NumberFormat("vi-VN", { style: "currency", currency: "VND" }).format(Object.is(rounded, -0) ? 0 : rounded);
+  const formatted = new Intl.NumberFormat("vi-VN").format(Object.is(rounded, -0) ? 0 : rounded);
+  return `${formatted} ${symbol}`;
 };
-const fmtShort = (n: number) => { 
+const fmtShort = (n: number, symbol: string = "đ") => { 
   const val = Math.round(n);
   const abs = Math.abs(val);
   if (abs >= 1e6) return (val / 1e6).toFixed(1) + "tr"; 
   if (abs >= 1e3) return (val / 1e3).toFixed(0) + "k"; 
-  return String(Object.is(val, -0) ? 0 : val); 
+  return (Object.is(val, -0) ? 0 : val) + " " + symbol; 
 };
 const timeAgo = (ts: number) => { const s=Math.floor((Date.now()-ts)/1000); if(s<60)return"vừa xong"; if(s<3600)return`${Math.floor(s/60)}p trước`; if(s<86400)return`${Math.floor(s/3600)}h trước`; return`${Math.floor(s/86400)}d trước`; };
 const genCode = () => Math.random().toString(36).slice(2,8).toUpperCase();
@@ -375,7 +376,7 @@ function Modal({ children, onClose }: { children: React.ReactNode, onClose: () =
   );
 }
 
-function BillDetailModal({ bill, group, memberAvatars, onClose }: { bill: Expense, group: Group, memberAvatars?: Record<string, string>, onClose: () => void }) {
+function BillDetailModal({ bill, group, memberAvatars, onClose, currency = "đ" }: { bill: Expense, group: Group, memberAvatars?: Record<string, string>, onClose: () => void, currency?: string }) {
   if (!bill) return null;
   const members = group.members;
   const { splitMode, amount, payers, items, desc, ts, attachment, participants } = bill;
@@ -402,7 +403,7 @@ function BillDetailModal({ bill, group, memberAvatars, onClose }: { bill: Expens
 
       <div style={{ background: "linear-gradient(135deg, #82edc0, #7be0dc)", borderRadius: 12, padding: "12px 16px", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <span style={{ color: "#0b565e", fontSize: 12, fontWeight: 600 }}>Tổng hóa đơn</span>
-        <span style={{ color: "#0b565e", fontWeight: 800, fontSize: 20 }}>{fmt(amount)}</span>
+        <span style={{ color: "#0b565e", fontWeight: 800, fontSize: 20 }}>{fmt(amount, currency)}</span>
       </div>
       
       <div style={{ marginBottom: 12 }}>
@@ -411,7 +412,7 @@ function BillDetailModal({ bill, group, memberAvatars, onClose }: { bill: Expens
           <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: "#f0fdf4", borderRadius: 11, padding: "9px 13px", marginBottom: 5 }}>
             <Av name={name} size={34} ci={members.indexOf(name)} avatar={memberAvatars?.[name] || bill.memberDetails?.[name]?.avatar} />
             <div style={{ flex: 1 }}><div style={{ fontWeight: 700, fontSize: 13 }}>{name}</div></div>
-            <span style={{ fontWeight: 800, fontSize: 14, color: "#059669" }}>{fmt(amt)}</span>
+            <span style={{ fontWeight: 800, fontSize: 14, color: "#059669" }}>{fmt(amt, currency)}</span>
           </div>
         ))}
       </div>
@@ -433,11 +434,11 @@ function BillDetailModal({ bill, group, memberAvatars, onClose }: { bill: Expens
                 {Math.abs(Math.round(diff)) >= 1 && (
                   <div style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>
                     <span style={{ fontWeight: 900, color: diff >= 0 ? "#16a34a" : "#dc2626", background: diff >= 0 ? "#dcfce7" : "#fee2e2", padding: "1px 4px", borderRadius: 4, fontSize: 9 }}>{diff >= 0 ? "💰 ĐÃ DƯ" : "🔴 CÒN NỢ"}</span>
-                    <span style={{ color: "#2d666d" }}>{fmt(Math.abs(diff))}</span>
+                    <span style={{ color: "#2d666d" }}>{fmt(Math.abs(diff), currency)}</span>
                   </div>
                 )}
               </div>
-              <span style={{ fontWeight: 800, fontSize: 13, color: diff >= 0 ? "#16a34a" : "#dc2626" }}>{fmt(share)}</span>
+              <span style={{ fontWeight: 800, fontSize: 13, color: diff >= 0 ? "#16a34a" : "#dc2626" }}>{fmt(share, currency)}</span>
             </div>
           );
         })}
@@ -451,7 +452,7 @@ function BillDetailModal({ bill, group, memberAvatars, onClose }: { bill: Expens
               <div key={idx} style={{ padding: "8px 0", borderBottom: idx === items.length - 1 ? "none" : "1px solid rgba(11,86,94,0.1)" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontWeight: 600 }}>
                   <span style={{ fontSize: 13, color: "#0b565e", flex: 1, paddingRight: 10 }}>{it.name}</span>
-                  <span style={{ color: "#0b565e", fontSize: 13, whiteSpace: "nowrap" }}>{fmt(it.price || 0)}</span>
+                  <span style={{ color: "#0b565e", fontSize: 13, whiteSpace: "nowrap" }}>{fmt(it.price || 0, currency)}</span>
                 </div>
                 <div style={{ fontSize: 11, color: "#2d666d", marginTop: 4 }}>
                   {it.assignedTo.length > 0 ? it.assignedTo.join(", ") : "Chia đều cả nhóm"}
@@ -479,7 +480,7 @@ const EXPENSE_CATEGORIES = [
   { id: "other", label: "Khác", icon: "📦", color: "#64748b" }
 ];
 
-function AddExpenseModal({ members, memberAvatars, onAdd, onClose }: { members: string[], memberAvatars?: Record<string, string>, onAdd: (e: Expense) => void, onClose: () => void }) {
+function AddExpenseModal({ members, memberAvatars, onAdd, onClose, currency = "đ" }: { members: string[], memberAvatars?: Record<string, string>, onAdd: (e: Expense) => void, onClose: () => void, currency?: string }) {
   const [desc, setDesc] = useState("");
   const [amount, setAmount] = useState("");
   const [category, setCategory] = useState("food");
@@ -751,7 +752,7 @@ function AddExpenseModal({ members, memberAvatars, onAdd, onClose }: { members: 
           <div style={{ background: "#f0fdf4", borderRadius: 12, padding: "12px", border: "1.5px solid #bbf7d0" }}>
              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <span style={{ fontSize: 13, fontWeight: 700, color: "#16a34a" }}>⚖️ Chia đều:</span>
-                <span style={{ fontSize: 16, fontWeight: 800, color: "#16a34a" }}>{fmt(amt / participants.length)} / người</span>
+                <span style={{ fontSize: 16, fontWeight: 800, color: "#16a34a" }}>{fmt(amt / participants.length, currency)} / người</span>
              </div>
              <div style={{ fontSize: 10, color: "#16a34a", marginTop: 4, opacity: 0.8 }}>Hệ thống tự động tính cho {participants.length} thành viên tham gia</div>
           </div>
@@ -764,7 +765,7 @@ function AddExpenseModal({ members, memberAvatars, onAdd, onClose }: { members: 
               <div key={idx} style={{marginBottom: 12, padding: "10px", border: "1px solid #e2e8f0", borderRadius: 10, background: "#fff"}}>
                 <div style={{display: "flex", justifyContent: "space-between", fontWeight: 600, marginBottom: 8}}>
                   <span style={{fontSize: 13, color: "#1e293b"}}>{it.name}</span>
-                  <span style={{color: "#ec4899", fontSize: 13}}>{fmt(it.price || 0)}</span>
+                  <span style={{color: "#ec4899", fontSize: 13}}>{fmt(it.price || 0, currency)}</span>
                 </div>
                 <div style={{display: "flex", flexWrap: "wrap", gap: 6}}>
                   {members.map(m => {
@@ -790,14 +791,14 @@ function AddExpenseModal({ members, memberAvatars, onAdd, onClose }: { members: 
                   <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
                     <Av name={m} size={26} ci={i} avatar={memberAvatars?.[m]}/><span style={{ flex: 1, fontSize: 12, fontWeight: 600 }}>{m}</span>
                     <input type="number" value={splits[m] || ""} onChange={e => updateSplit(m, e.target.value)} placeholder="0" style={{ width: 60, border: "2px solid #e2e8f0", borderRadius: 8, padding: "5px 7px", fontSize: 13, outline: "none", textAlign: "right" }} />
-                    <span style={{ fontSize: 11, color: "#94a3b8", minWidth: 60 }}>{fmt((splits[m] || 0) / 100 * amt)}</span>
+                    <span style={{ fontSize: 11, color: "#94a3b8", minWidth: 60 }}>{fmt((splits[m] || 0) / 100 * amt, currency)}</span>
                   </div>
                 ))}
               </>
             )}
             {mode === "adjust" && (
               <>
-                <div style={{ fontSize: 11, color: Math.abs(totalAdj) < 1 ? "#059669" : "#dc2626", fontWeight: 700, marginBottom: 8 }}>Bù: {fmt(totalAdj)}</div>
+                <div style={{ fontSize: 11, color: Math.abs(totalAdj) < 1 ? "#059669" : "#dc2626", fontWeight: 700, marginBottom: 8 }}>Bù: {fmt(totalAdj, currency)}</div>
                 {members.map((m, i) => (
                   <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
                     <Av name={m} size={26} ci={i} avatar={memberAvatars?.[m]}/><span style={{ flex: 1, fontSize: 12, fontWeight: 600 }}>{m}</span>
@@ -822,7 +823,7 @@ function AddExpenseModal({ members, memberAvatars, onAdd, onClose }: { members: 
   );
 }
 
-function PayModal({ members, memberAvatars, transactions, onPay, onClose }: { members: string[], memberAvatars?: Record<string, string>, transactions: any[], onPay: (p: Payment) => void, onClose: () => void }) {
+function PayModal({ members, memberAvatars, transactions, onPay, onClose, currency = "đ" }: { members: string[], memberAvatars?: Record<string, string>, transactions: any[], onPay: (p: Payment) => void, onClose: () => void, currency?: string }) {
   const [from,setFrom]=useState(transactions[0]?.from||members[0]||"");
   const [to,setTo]=useState(transactions[0]?.to||"");
   const [amount,setAmount]=useState(transactions[0]?Math.round(transactions[0].amount):"");
@@ -897,7 +898,7 @@ function PayModal({ members, memberAvatars, transactions, onPay, onClose }: { me
           ))}
         </div>
       </div>
-      {suggested&&<div style={{background:"#fff7ed",borderRadius:9,padding:"7px 11px",marginBottom:10,fontSize:12,color:"#d97706",display:"flex",alignItems:"center",gap:6}}>💡 <span><b>{from}</b> cần trả <b>{fmt(suggested.amount)}</b></span><button onClick={()=>handlePay(Math.round(suggested.amount))} style={{marginLeft:"auto",background:"#d97706",color:"#fff",border:"none",borderRadius:6,padding:"3px 8px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Dùng</button></div>}
+      {suggested&&<div style={{background:"#fff7ed",borderRadius:9,padding:"7px 11px",marginBottom:10,fontSize:12,color:"#d97706",display:"flex",alignItems:"center",gap:6}}>💡 <span><b>{from}</b> cần trả <b>{fmt(suggested.amount, currency)}</b></span><button onClick={()=>handlePay(Math.round(suggested.amount))} style={{marginLeft:"auto",background:"#d97706",color:"#fff",border:"none",borderRadius:6,padding:"3px 8px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Dùng</button></div>}
       <Input 
         placeholder="Số tiền" 
         type="text" 
@@ -919,7 +920,7 @@ function PayModal({ members, memberAvatars, transactions, onPay, onClose }: { me
   );
 }
 
-function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClose, onUpdate, onLeave, onDelete, sendInviteEmail }: { group: Group, friends: Friend[], currentUser: string, memberAvatars?: Record<string, string>, onClose: () => void, onUpdate: (g: Group) => void, onLeave: () => void, onDelete: () => void, sendInviteEmail: (email: string, inviterName: string, groupName?: string, inviteCode?: string) => Promise<boolean> }) {
+function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClose, onUpdate, onLeave, onDelete, sendInviteEmail }: { group: Group, friends: Friend[], currentUser: string, memberAvatars?: Record<string, string>, onClose: () => void, onUpdate: (g: Group) => void, onLeave: () => void, onDelete: () => void, sendInviteEmail: (email: string, inviterName: string, groupName?: string, inviteCode?: string, groupId?: string) => Promise<boolean> }) {
   const [newMemberName, setNewMemberName] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
   const [sendingInvite, setSendingInvite] = useState(false);
@@ -941,12 +942,12 @@ function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClos
       return;
     }
     setSendingInvite(true);
-    const success = await sendInviteEmail(inviteEmail.trim(), currentUser, group.name, group.inviteCode);
+    const success = await sendInviteEmail(inviteEmail.trim(), currentUser, group.name, group.inviteCode, group.id);
     if (success) {
       alert("📧 Đã gửi lời mời tới " + inviteEmail);
       setInviteEmail("");
     } else {
-      alert("❌ Gửi lời mời thất bại. Hãy kiểm tra cấu hình RESEND_API_KEY.");
+      alert("❌ Gửi lời mời thất bại. Kiểm tra SMTP.");
     }
     setSendingInvite(false);
   };
@@ -1052,7 +1053,7 @@ function GroupSettingsModal({ group, friends, currentUser, memberAvatars, onClos
   );
 }
 
-function GroupStats({ group, expenses, payments, balances }: { group: Group, expenses: Expense[], payments: Payment[], balances: Record<string, number>, transactions: any[] }) {
+function GroupStats({ group, expenses, payments, balances, currency = "đ" }: { group: Group, expenses: Expense[], payments: Payment[], balances: Record<string, number>, transactions: any[], currency?: string }) {
   const [chartView,setChartView]=useState("spend"); // spend | debt | cat | trend
   const members=group.members;
 
@@ -1123,14 +1124,14 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
         <div style={{ background: "white", padding: "8px 12px", border: "1px solid #e2e8f0", borderRadius: 8, boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1)" }}>
           <p style={{ fontWeight: 700, margin: 0, fontSize: 12, color: "#1e293b" }}>{data.name}</p>
           {chartView === "spend" ? (
-            <p style={{ margin: 0, fontSize: 12, fontWeight: 800, color: data.color }}>{fmt(data.paid)}</p>
+            <p style={{ margin: 0, fontSize: 12, fontWeight: 800, color: data.color }}>{fmt(data.paid, currency)}</p>
           ) : (
             <>
-              <p style={{ margin: 0, fontSize: 11, color: "#64748b" }}>Đã góp: <span style={{ fontWeight: 700, color: "#059669" }}>{fmt(data.contribution)}</span></p>
-              <p style={{ margin: 0, fontSize: 11, color: "#64748b" }}>Phần chi: <span style={{ fontWeight: 700, color: "#1e293b" }}>{fmt(data.share)}</span></p>
+              <p style={{ margin: 0, fontSize: 11, color: "#64748b" }}>Đã góp: <span style={{ fontWeight: 700, color: "#059669" }}>{fmt(data.contribution, currency)}</span></p>
+              <p style={{ margin: 0, fontSize: 11, color: "#64748b" }}>Phần chi: <span style={{ fontWeight: 700, color: "#1e293b" }}>{fmt(data.share, currency)}</span></p>
               <p style={{ margin: 0, fontSize: 11, fontWeight: 700, color: Math.round(data.balance) >= 1 ? "#059669" : Math.round(data.balance) <= -1 ? "#dc2626" : "#64748b" }}>
                 {Math.abs(Math.round(data.balance)) >= 1 ? (data.balance > 0 ? "Dư: +" : "Nợ: ") : "Đã xong"}
-                {Math.abs(Math.round(data.balance)) >= 1 ? fmt(data.balance) : ""}
+                {Math.abs(Math.round(data.balance)) >= 1 ? fmt(data.balance, currency) : ""}
               </p>
             </>
           )}
@@ -1154,7 +1155,7 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
           {chartView === "spend" ? (
             <BarChart data={memberStats} layout="vertical" margin={{ top: 5, right: 15, left: -20, bottom: 5 }}>
               <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f1f5f9" />
-              <XAxis type="number" fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v)} />
+              <XAxis type="number" fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v, currency)} />
               <YAxis dataKey="name" type="category" fontSize={11} fontWeight={600} stroke="#475569" width={75} />
               <Tooltip content={<CustomTooltip />} cursor={{ fill: "#f8fafc" }} />
               <Bar dataKey="paid" radius={[0, 4, 4, 0]} barSize={24}>
@@ -1166,7 +1167,7 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
           ) : chartView === "debt" ? (
             <BarChart data={memberStats} layout="vertical" margin={{ top: 5, right: 15, left: -20, bottom: 5 }}>
               <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f1f5f9" />
-              <XAxis type="number" fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v)} />
+              <XAxis type="number" fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v, currency)} />
               <YAxis dataKey="name" type="category" fontSize={11} fontWeight={600} stroke="#475569" width={75} />
               <Tooltip content={<CustomTooltip />} cursor={{ fill: "#f8fafc" }} />
               <Bar dataKey="paidPortion" stackId="a" fill="#059669" radius={[0, 0, 0, 0]} barSize={24} name="Đã trả" opacity={0.8} />
@@ -1177,7 +1178,7 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
           ) : chartView === "cat" ? (
             <BarChart data={categoryData} layout="vertical" margin={{ top: 5, right: 15, left: -20, bottom: 5 }}>
               <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f1f5f9" />
-              <XAxis type="number" fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v)} />
+              <XAxis type="number" fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v, currency)} />
               <YAxis dataKey="name" type="category" fontSize={11} fontWeight={600} stroke="#475569" width={75} />
               <Tooltip formatter={(v:any)=>fmt(v)} cursor={{ fill: "#f8fafc" }} />
               <Bar dataKey="value" radius={[0, 4, 4, 0]} barSize={24}>
@@ -1196,7 +1197,7 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
               </defs>
               <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
               <XAxis dataKey="name" fontSize={10} stroke="#94a3b8" dy={10} />
-              <YAxis fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v)} width={40} />
+              <YAxis fontSize={10} stroke="#94a3b8" tickFormatter={(v)=>fmtShort(v, currency)} width={40} />
               <Tooltip formatter={(v:any)=>fmt(v)} />
               <Area type="monotone" dataKey="amount" stroke="#059669" strokeWidth={3} fillOpacity={1} fill="url(#colorAmt)" />
             </AreaChart>
@@ -1206,7 +1207,7 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
 
       <div style={{ marginTop: 16, display: "flex", flexWrap: "wrap", gap: 12, justifyContent: "center" }}>
         {chartView === "spend" ? (
-          <div style={{fontSize:12,color:"#64748b"}}>Tổng chi tiêu nhóm: <b style={{color:"#059669"}}>{fmt(totalSpend)}</b></div>
+          <div style={{fontSize:12,color:"#64748b"}}>Tổng chi tiêu nhóm: <b style={{color:"#059669"}}>{fmt(totalSpend, currency)}</b></div>
         ) : chartView === "debt" ? (
           <div style={{display:"flex",gap:12}}>
             <div style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:"#64748b"}}>
@@ -1220,7 +1221,7 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
             </div>
           </div>
         ) : chartView === "cat" ? (
-           <div style={{fontSize:11,color:"#64748b"}}>Danh mục chi tiêu nhiều nhất: <b style={{color:"#1e293b"}}>{categoryData[0]?.name || "N/A"} ({fmt(categoryData[0]?.value || 0)})</b></div>
+           <div style={{fontSize:11,color:"#64748b"}}>Danh mục chi tiêu nhiều nhất: <b style={{color:"#1e293b"}}>{categoryData[0]?.name || "N/A"} ({fmt(categoryData[0]?.value || 0, currency)})</b></div>
         ) : (
            <div style={{fontSize:11,color:"#64748b"}}>Tần suất chi tiêu: <b style={{color:"#1e293b"}}>{expenses.length} khoản chi</b></div>
         )}
@@ -1229,11 +1230,11 @@ function GroupStats({ group, expenses, payments, balances }: { group: Group, exp
       <div style={{marginTop: 20, paddingTop: 16, borderTop: "1px dashed #e2e8f0", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10}}>
         <div style={{background: "#f8fafc", padding: 10, borderRadius: 12}}>
           <div style={{fontSize: 10, color: "#64748b", fontWeight: 700, textTransform: "uppercase", marginBottom: 4}}>Khoản chi lớn nhất</div>
-          <div style={{fontSize: 14, fontWeight: 800, color: "#1e293b"}}>{fmt(Math.max(...expenses.map(e => e.amount), 0))}</div>
+          <div style={{fontSize: 14, fontWeight: 800, color: "#1e293b"}}>{fmt(Math.max(...expenses.map(e => e.amount), 0), currency)}</div>
         </div>
         <div style={{background: "#f8fafc", padding: 10, borderRadius: 12}}>
           <div style={{fontSize: 10, color: "#64748b", fontWeight: 700, textTransform: "uppercase", marginBottom: 4}}>TB mỗi khoản chi</div>
-          <div style={{fontSize: 14, fontWeight: 800, color: "#1e293b"}}>{fmt(expenses.length ? totalSpend / expenses.length : 0)}</div>
+          <div style={{fontSize: 14, fontWeight: 800, color: "#1e293b"}}>{fmt(expenses.length ? totalSpend / expenses.length : 0, currency)}</div>
         </div>
       </div>
     </Card>
@@ -1278,7 +1279,7 @@ function EmailSettingsModal({ prefs, onUpdate, onClose }: { prefs: UserPrefs, on
   );
 }
 
-function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddExpense: (groupId: string, e: Expense) => void }) {
+function ReceiptScannerView({ groups, onAddExpense, currency = "đ" }: { groups: Group[], onAddExpense: (groupId: string, e: Expense) => void, currency?: string }) {
   const [step, setStep] = useState(1);
   const [groupId, setGroupId] = useState("");
   const [imageStr, setImageStr] = useState<string | null>(null);
@@ -1505,7 +1506,7 @@ function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddEx
             <Input placeholder="Mô tả hóa đơn" value={desc} onChange={(e: any) => setDesc(e.target.value)} style={{marginBottom: 10}} />
             <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px", background: "#fdf2f8", borderRadius: 10, color: "#be185d", fontWeight: 800}}>
               <span>Tổng cộng:</span>
-              <span style={{fontSize: 18}}>{total.toLocaleString()}đ</span>
+              <span style={{fontSize: 18}}>{fmt(total, currency)}</span>
             </div>
           </Card>
 
@@ -1538,7 +1539,7 @@ function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddEx
               <div key={idx} style={{marginBottom: 12, padding: "10px", border: "1px solid #e2e8f0", borderRadius: 10}}>
                 <div style={{display: "flex", justifyContent: "space-between", fontWeight: 600, marginBottom: 8}}>
                   <span>{it.name}</span>
-                  <span style={{color: "#ec4899"}}>{(it.price || 0).toLocaleString()}đ</span>
+                  <span style={{color: "#ec4899"}}>{fmt(it.price || 0, currency)}</span>
                 </div>
                 <div style={{display: "flex", flexWrap: "wrap", gap: 6}}>
                   {members.map(m => {
@@ -1562,7 +1563,8 @@ function ReceiptScannerView({ groups, onAddExpense }: { groups: Group[], onAddEx
   );
 }
 
-function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBack, sendInviteEmail }: { group: Group, friends: Friend[], profile: UserProfile | null, onUpdate: (g: Group) => void, onDelete: () => void, onLeave: () => void, onBack: () => void, sendInviteEmail: (email: string, inviterName: string, groupName?: string, inviteCode?: string) => Promise<boolean> }) {
+function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBack, sendInviteEmail }: { group: Group, friends: Friend[], profile: UserProfile | null, onUpdate: (g: Group) => void, onDelete: () => void, onLeave: () => void, onBack: () => void, sendInviteEmail: (email: string, inviterName: string, groupName?: string, inviteCode?: string, groupId?: string) => Promise<boolean> }) {
+  const currency = profile?.currency || "đ";
   const [subTab,setSubTab]=useState("home");
   const [selectedBill,setSelectedBill]=useState<Expense | null>(null);
   const [showAddExp,setShowAddExp]=useState(false);
@@ -1633,7 +1635,7 @@ function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBac
       }));
       await addDoc(collection(db, "groups", group.id, "feed"), {
         type: "expense",
-        text: `${mainPayer} đã thêm "${exp.desc}" — ${fmt(exp.amount)}`,
+        text: `${mainPayer} đã thêm "${exp.desc}" — ${fmt(exp.amount, currency)}`,
         ts: Date.now(),
         icon: "🧾",
         name: mainPayer
@@ -1651,7 +1653,7 @@ function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBac
       await addDoc(collection(db, "groups", group.id, "payments"), clean({ ...data, createdBy: auth.currentUser?.uid }));
       await addDoc(collection(db, "groups", group.id, "feed"), {
         type: "paid",
-        text: `${p.from} đã trả ${fmt(p.amount)} cho ${p.to}${p.note?" · "+p.note:""}`,
+        text: `${p.from} đã trả ${fmt(p.amount, currency)} cho ${p.to}${p.note?" · "+p.note:""}`,
         ts: p.ts,
         icon: "✅",
         name: p.from
@@ -1710,11 +1712,12 @@ function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBac
           bill={selectedBill} 
           group={group} 
           memberAvatars={memberAvatars}
-          onClose={() => setSelectedBill(null)} 
+          onClose={() => setSelectedBill(null)}
+          currency={currency}
         />
       )}
-      {showAddExp&&<AddExpenseModal members={members} memberAvatars={memberAvatars} onAdd={addExpense} onClose={()=>setShowAddExp(false)}/>}
-      {showPay&&<PayModal members={members} memberAvatars={memberAvatars} transactions={transactions} onPay={addPayment} onClose={()=>setShowPay(false)}/>}
+      {showAddExp&&<AddExpenseModal members={members} memberAvatars={memberAvatars} onAdd={addExpense} onClose={()=>setShowAddExp(false)} currency={currency}/>}
+      {showPay&&<PayModal members={members} memberAvatars={memberAvatars} transactions={transactions} onPay={addPayment} onClose={()=>setShowPay(false)} currency={currency}/>}
       {showSettings&&<GroupSettingsModal group={group} friends={friends} currentUser={auth.currentUser?.displayName || ""} memberAvatars={memberAvatars} onClose={()=>setShowSettings(false)} onUpdate={onUpdate} onLeave={onLeave} onDelete={onDelete} sendInviteEmail={sendInviteEmail}/>}
 
       <div style={{background:"linear-gradient(135deg, #0b565e, #147f87)",padding:"12px 16px 0",flexShrink:0}}>
@@ -1723,7 +1726,7 @@ function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBac
           <div style={{fontSize:32}}>{group.emoji}</div>
           <div style={{flex:1}}>
             <div style={{color:"#fff",fontWeight:800,fontSize:17}}>{group.name}</div>
-            <div style={{color:"rgba(255,255,255,0.9)",fontSize:11,fontWeight:600}}>{members.length} thành viên · {total > 0 ? fmt(total) : "Chưa chi"}</div>
+            <div style={{color:"rgba(255,255,255,0.9)",fontSize:11,fontWeight:600}}>{members.length} thành viên · {total > 0 ? fmt(total, currency) : "Chưa chi"}</div>
           </div>
           <button onClick={()=>setShowSettings(true)} style={{background:"rgba(255,255,255,.2)",border:"none",borderRadius:9,width:34,height:34,color:"#fff",fontSize:16,cursor:"pointer"}}>⚙️</button>
         </div>
@@ -1766,7 +1769,7 @@ function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBac
                           {toRes.isMe && <span style={{fontWeight: 400, fontSize: 11, color: "#94a3b8"}}>(Bạn)</span>}
                         </span>
                       </div>
-                      <span style={{fontWeight:800,fontSize:14,color:"#059669"}}>{fmt(t.amount)}</span>
+                      <span style={{fontWeight:800,fontSize:14,color:"#059669"}}>{fmt(t.amount, currency)}</span>
                     </div>
                   );
                 })}
@@ -1792,7 +1795,7 @@ function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBac
                             {Object.keys(e.payers).filter(k => (e.items ? e.payers[k] : (e.payers[k] || 0)) > 0).join(", ")}
                           </div>
                         </div>
-                        <div style={{textAlign:"right"}}><div style={{fontWeight:800,fontSize:13,color:"#db2777"}}>{fmt(e.amount)}</div></div>
+                        <div style={{textAlign:"right"}}><div style={{fontWeight:800,fontSize:13,color:"#db2777"}}>{fmt(e.amount, currency)}</div></div>
                       </div>
                     </Card>
                   );
@@ -1806,7 +1809,7 @@ function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBac
                           <div style={{fontWeight:800,fontSize:14}}>{p.from} trả {p.to}</div>
                           <div style={{fontSize:11,color:"#059669",fontWeight:600}}>{p.note || "Xác nhận trả nợ"}</div>
                         </div>
-                        <div style={{textAlign:"right"}}><div style={{fontWeight:800,fontSize:13,color:"#059669"}}>{fmt(p.amount)}</div></div>
+                        <div style={{textAlign:"right"}}><div style={{fontWeight:800,fontSize:13,color:"#059669"}}>{fmt(p.amount, currency)}</div></div>
                       </div>
                     </Card>
                   );
@@ -1823,7 +1826,7 @@ function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBac
         )}
 
         {subTab==="stats"&&(
-          <GroupStats group={group} expenses={expenses} payments={payments} balances={balances} transactions={transactions}/>
+          <GroupStats group={group} expenses={expenses} payments={payments} balances={balances} transactions={transactions} currency={currency}/>
         )}
 
         {subTab==="members"&&(
@@ -1883,26 +1886,26 @@ function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBac
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
                   <div style={{ background: "#f8fafc", padding: 14, borderRadius: 16, textAlign: "center" }}>
                     <div style={{ fontSize: 10, fontWeight: 800, color: "#64748b", textTransform: "uppercase", marginBottom: 4 }}>Đã chi cho nhóm</div>
-                    <div style={{ fontWeight: 800, fontSize: 16, color: "#0f172a" }}>{fmt(memberStats.spentByMember)}</div>
+                    <div style={{ fontWeight: 800, fontSize: 16, color: "#0f172a" }}>{fmt(memberStats.spentByMember, currency)}</div>
                   </div>
                   <div style={{ background: "#f8fafc", padding: 14, borderRadius: 16, textAlign: "center" }}>
                     <div style={{ fontSize: 10, fontWeight: 800, color: "#64748b", textTransform: "uppercase", marginBottom: 4 }}>Đã chi cho bạn</div>
-                    <div style={{ fontWeight: 800, fontSize: 16, color: "#059669" }}>{fmt(memberStats.spentForMe)}</div>
+                    <div style={{ fontWeight: 800, fontSize: 16, color: "#059669" }}>{fmt(memberStats.spentForMe, currency)}</div>
                   </div>
                   <div style={{ background: "#f8fafc", padding: 14, borderRadius: 16, textAlign: "center" }}>
                     <div style={{ fontSize: 10, fontWeight: 800, color: "#64748b", textTransform: "uppercase", marginBottom: 4 }}>Đã thanh toán</div>
-                    <div style={{ fontWeight: 800, fontSize: 16, color: "#2563eb" }}>{fmt(memberStats.paidByMember)}</div>
+                    <div style={{ fontWeight: 800, fontSize: 16, color: "#2563eb" }}>{fmt(memberStats.paidByMember, currency)}</div>
                   </div>
                   <div style={{ background: "#f8fafc", padding: 14, borderRadius: 16, textAlign: "center" }}>
                     <div style={{ fontSize: 10, fontWeight: 800, color: "#64748b", textTransform: "uppercase", marginBottom: 4 }}>Đã nhận về</div>
-                    <div style={{ fontWeight: 800, fontSize: 16, color: "#ea580c" }}>{fmt(memberStats.receivedByMember)}</div>
+                    <div style={{ fontWeight: 800, fontSize: 16, color: "#ea580c" }}>{fmt(memberStats.receivedByMember, currency)}</div>
                   </div>
                 </div>
 
                 <div style={{ background: memberStats.netBalance >= 0 ? "#ecfdf5" : "#fef2f2", padding: 16, borderRadius: 16, textAlign: "center", border: `1.5px solid ${memberStats.netBalance >= 0 ? "#059669" : "#dc2626"}` }}>
                   <div style={{ fontSize: 11, fontWeight: 800, color: memberStats.netBalance >= 0 ? "#059669" : "#dc2626", textTransform: "uppercase", marginBottom: 6 }}>Tổng chênh lệch</div>
                   <div style={{ fontWeight: 900, fontSize: 24, color: memberStats.netBalance >= 0 ? "#059669" : "#dc2626" }}>
-                    {memberStats.netBalance > 0 ? "+" : ""}{fmt(memberStats.netBalance)}
+                    {memberStats.netBalance > 0 ? "+" : ""}{fmt(memberStats.netBalance, currency)}
                   </div>
                   <div style={{ fontSize: 11, color: memberStats.netBalance >= 0 ? "#059669" : "#dc2626", marginTop: 4, opacity: 0.8 }}>
                     {memberStats.netBalance >= 0 ? "Được nhận lại từ nhóm" : "Cần đóng thêm cho nhóm"}
@@ -1955,7 +1958,7 @@ function GroupView({ group, friends, profile, onUpdate, onDelete, onLeave, onBac
   );
 }
 
-function FriendActionModal({ friend, groups, onClose, onPay }: { friend: Friend, groups: Group[], onClose: () => void, onPay: (group: Group) => void }) {
+function FriendActionModal({ friend, groups, onClose, onPay, currency = "đ" }: { friend: Friend, groups: Group[], onClose: () => void, onPay: (group: Group) => void, currency?: string }) {
   const [activeTab, setActiveTab] = useState("overview");
 
   const friendBalances = useMemo(() => {
@@ -1981,7 +1984,7 @@ function FriendActionModal({ friend, groups, onClose, onPay }: { friend: Friend,
   const sendReminder = () => {
     if (!friend.email) return;
     const subject = encodeURIComponent("Nhắc nhở thanh toán - HappyShare");
-    const body = encodeURIComponent(`Chào ${friend.name},\n\nBạn đang có khoản nợ/dư là ${fmt(Math.abs(friendBalances.netBalance))} trong ứng dụng HappyShare.\n\nHãy kiểm tra và thanh toán nhé!\n\nTrân trọng.`);
+    const body = encodeURIComponent(`Chào ${friend.name},\n\nBạn đang có khoản nợ/dư là ${fmt(Math.abs(friendBalances.netBalance), currency)} trong ứng dụng HappyShare.\n\nHãy kiểm tra và thanh toán nhé!\n\nTrân trọng.`);
     window.location.href = `mailto:${friend.email}?subject=${subject}&body=${body}`;
   };
 
@@ -2026,7 +2029,7 @@ function FriendActionModal({ friend, groups, onClose, onPay }: { friend: Friend,
             <span style={{ flex: 1, fontSize: 13, fontWeight: 700, color: "#0b565e" }}>{gd.name}</span>
             {Math.abs(Math.round(gd.balance)) >= 1 && (
               <span style={{ fontWeight: 800, fontSize: 13, color: gd.balance >= 0 ? "#059669" : "#dc2626" }}>
-                {gd.balance >= 0 ? "+" : ""}{fmt(gd.balance)}
+                {gd.balance >= 0 ? "+" : ""}{fmt(gd.balance, currency)}
               </span>
             )}
           </div>
@@ -2037,7 +2040,7 @@ function FriendActionModal({ friend, groups, onClose, onPay }: { friend: Friend,
   );
 }
 
-function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick }: { friends: Friend[], groups: Group[], onAddFriend: (f: Friend) => void, onRemoveFriend: (id: string) => void, onPayClick: (g: Group) => void }) {
+function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick, currency = "đ" }: { friends: Friend[], groups: Group[], onAddFriend: (f: Friend) => void, onRemoveFriend: (id: string) => void, onPayClick: (g: Group) => void, currency?: string }) {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [selectedFriend, setSelectedFriend] = useState<Friend | null>(null);
@@ -2062,7 +2065,7 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
 
   return (
     <div style={{ padding: "12px 14px" }}>
-      {selectedFriend && <FriendActionModal friend={selectedFriend} groups={groups} onClose={() => setSelectedFriend(null)} onPay={(g) => { setSelectedFriend(null); onPayClick(g); }} />}
+      {selectedFriend && <FriendActionModal friend={selectedFriend} groups={groups} onClose={() => setSelectedFriend(null)} onPay={(g) => { setSelectedFriend(null); onPayClick(g); }} currency={currency} />}
       
       <Card style={{ padding: "18px", marginBottom: 20 }}>
         <SecTitle icon="👥" title="Thêm bạn mới" color="#059669" />
@@ -2213,7 +2216,7 @@ function FriendsView({ friends, groups, onAddFriend, onRemoveFriend, onPayClick 
   );
 }
 
-function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup }: { groups: Group[], friends: Friend[], onSelectGroup: (g: Group) => void, onCreateGroup: (g: Group) => void }) {
+function GroupsListView({ groups, friends, onSelectGroup, onCreateGroup, currency = "đ" }: { groups: Group[], friends: Friend[], onSelectGroup: (g: Group) => void, onCreateGroup: (g: Group) => void, currency?: string }) {
   const [showCreate,setShowCreate] = useState(false);
   const [gName,setGName] = useState(""); const [gEmoji,setGEmoji] = useState("🎉");
 
@@ -2292,6 +2295,7 @@ interface UserProfile {
   avatar: string;
   email: string;
   createdAt: number;
+  currency?: string;
 }
 
 interface UserPrefs {
@@ -2300,6 +2304,17 @@ interface UserPrefs {
   emailOnAddedToGroup: boolean;
   emailOnAddedAsFriend: boolean;
   emailOnMonthlyReport: boolean;
+}
+
+interface GroupInvitation {
+  id: string;
+  groupId: string;
+  groupName: string;
+  inviterName: string;
+  inviteCode: string;
+  email: string;
+  status: "pending" | "accepted" | "declined";
+  createdAt: string;
 }
 
 const DEFAULT_PREFS: UserPrefs = {
@@ -2346,6 +2361,7 @@ function GroupSuccessModal({ group, onClose }: { group: Group, onClose: () => vo
 
 export default function App() {
   const [tab, setTab] = useState("groups");
+  const [invitations, setInvitations] = useState<GroupInvitation[]>([]);
   const [createdGroupParams, setCreatedGroupParams] = useState<{group: Group} | null>(null);
   const [joinCode, setJoinCode] = useState<string | null>(null);
   const [groupToJoin, setGroupToJoin] = useState<Group | null>(null);
@@ -2375,6 +2391,80 @@ export default function App() {
   const [showAvatarModal, setShowAvatarModal] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showSecurityModal, setShowSecurityModal] = useState(false);
+
+  const updateProfile = async (updates: Partial<UserProfile>) => {
+    if (!user || !profile) return;
+    const updated = { ...profile, ...updates };
+    setProfile(updated);
+    try {
+      await updateDoc(doc(db, "users", user.uid), clean(updates));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, "profile");
+    }
+  };
+
+  const updatePrefs = async (newPrefs: Partial<UserPrefs>) => {
+    if (!user) return;
+    const updated = { ...userPrefs, ...newPrefs };
+    setUserPrefs(updated);
+    try {
+      await updateDoc(doc(db, "users", user.uid), { prefs: clean(updated) });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, "prefs");
+    }
+  };
+
+  useEffect(() => {
+    if (!user || !user.email) return;
+    const q = query(collection(db, "groupInvitations"), where("email", "==", user.email.toLowerCase()), where("status", "==", "pending"));
+    const unsub = onSnapshot(q, (snap) => {
+      console.log("Fetched group invitations:", snap.docs.length);
+      setInvitations(snap.docs.map(d => ({ id: d.id, ...d.data() } as GroupInvitation)));
+    }, (err) => {
+      handleFirestoreError(err, OperationType.LIST, "groupInvitations");
+    });
+    return unsub;
+  }, [user]);
+
+  const acceptInvitation = async (inv: GroupInvitation) => {
+    if (!user || !profile) return;
+    try {
+      // 1. Join group logic
+      const gRef = doc(db, "groups", inv.groupId);
+      const gSnap = await getDoc(gRef);
+      if (gSnap.exists()) {
+        const gData = gSnap.data();
+        const memberUids = gData.memberUids || [];
+        if (!memberUids.includes(user.uid)) {
+          const newUids = [...memberUids, user.uid];
+          const newMembers = [...(gData.members || []), profile.name];
+          const newDetails = { ...(gData.memberDetails || {}), [user.uid]: { email: user.email, avatar: profile.avatar || "" } };
+          await updateDoc(gRef, { memberUids: newUids, members: newMembers, memberDetails: newDetails, updatedAt: serverTimestamp() });
+          
+          await addDoc(collection(db, "groups", inv.groupId, "feed"), {
+            type: "join",
+            text: `${profile.name} đã tham gia nhóm qua lời mời`,
+            ts: Date.now(),
+            icon: "👤",
+            name: profile.name
+          });
+        }
+      }
+      // 2. Mark invitation as accepted
+      await updateDoc(doc(db, "groupInvitations", inv.id), { status: "accepted" });
+      alert("Chấp nhận lời mời thành công! 🎉");
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `groupInvitations/${inv.id}`);
+    }
+  };
+
+  const declineInvitation = async (inv: GroupInvitation) => {
+    try {
+      await updateDoc(doc(db, "groupInvitations", inv.id), { status: "declined" });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `groupInvitations/${inv.id}`);
+    }
+  };
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (u) => {
@@ -2474,17 +2564,6 @@ export default function App() {
       } else {
         alert("❌ Có lỗi xảy ra khi xóa tài khoản: " + (err.message || String(err)));
       }
-    }
-  };
-
-  const updatePrefs = async (newPrefs: Partial<UserPrefs>) => {
-    if (!user) return;
-    const updated = { ...userPrefs, ...newPrefs };
-    setUserPrefs(updated);
-    try {
-      await updateDoc(doc(db, "users", user.uid), { prefs: clean(updated) });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, "prefs");
     }
   };
 
@@ -2610,7 +2689,30 @@ export default function App() {
     }
   };
 
-  const sendInviteEmail = async (email: string, inviterName: string, groupName?: string, inviteCode?: string) => {
+  const sendInviteEmail = async (email: string, inviterName: string, groupName?: string, inviteCode?: string, groupId?: string) => {
+    const targetEmail = email.trim().toLowerCase();
+    let emailSent = false;
+    let invitationCreated = false;
+
+    // 1. Try to create in-app invitation first (it's internal to our DB)
+    if (groupId) {
+      try {
+        await addDoc(collection(db, "groupInvitations"), {
+          groupId,
+          groupName: groupName || "HappyShare",
+          inviterName,
+          inviteCode: inviteCode || "",
+          email: targetEmail,
+          status: "pending",
+          createdAt: new Date().toISOString()
+        });
+        invitationCreated = true;
+      } catch (err) {
+        console.error("Failed to create in-app invitation:", err);
+      }
+    }
+
+    // 2. Try to send email
     try {
       const inviteLink = inviteCode 
         ? `${window.location.origin}/?joinCode=${inviteCode}`
@@ -2620,7 +2722,7 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          email,
+          email: targetEmail,
           inviterName,
           groupName: groupName || "HappyShare",
           inviteLink
@@ -2628,15 +2730,22 @@ export default function App() {
       });
       
       const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || "Failed to send email");
+      if (response.ok) {
+        emailSent = true;
+      } else {
+        console.warn("Email API error:", data.error);
+        if (response.status === 503) {
+          alert("⚠️ Chú ý: Lời mời trong app đã được gửi, nhưng Email chưa gửi được do chưa cài đặt SMTP (SMTP_USER, SMTP_PASS).");
+        }
       }
-      return true;
     } catch (err) {
-      console.error("Email send error:", err);
-      // alert("Không thể gửi email: " + (err instanceof Error ? err.message : String(err)));
-      return false;
+      console.error("Email fetch error:", err);
     }
+
+    if (invitationCreated || emailSent) {
+      return true;
+    }
+    return false;
   };
 
   const addFriend = async (f: Friend) => {
@@ -2653,7 +2762,7 @@ export default function App() {
         if (success) {
           console.log("Email sent successfully");
         } else {
-          alert("Lời mời đã được lưu, nhưng email không gửi được. Hãy kiểm tra cấu hình RESEND_API_KEY.");
+          alert("Lời mời đã được lưu, nhưng email không gửi được. Hãy kiểm tra cấu hình SMTP.");
         }
       }
     } catch (err) {
@@ -2810,9 +2919,10 @@ export default function App() {
         memberDetails: g?.memberDetails || {}
       }));
       const mainPayer = Object.keys(exp.payers).find(k => (exp.payers[k] || 0) > 0) || "Ai đó";
+      const currency = profile?.currency || "đ";
       await addDoc(collection(db, "groups", groupId, "feed"), {
         type: "expense",
-        text: `${mainPayer} đã quét hoá đơn "${exp.desc}" — ${fmt(exp.amount)}`,
+        text: `${mainPayer} đã quét hoá đơn "${exp.desc}" — ${fmt(exp.amount, currency)}`,
         ts: Date.now(),
         icon: "📷",
         name: mainPayer
@@ -3039,15 +3149,56 @@ export default function App() {
         <div style={{width: 40}} /> {/* Spacer for balance */}
       </div>
 
+      {/* INVITATIONS */}
+      {invitations.length > 0 && (
+        <div style={{ padding: "0 20px 10px" }}>
+          {invitations.map(inv => (
+            <div key={inv.id} style={{ 
+              background: "linear-gradient(135deg, #10b981, #059669)", 
+              color: "#fff", 
+              padding: "12px 16px", 
+              borderRadius: 14, 
+              marginBottom: 8, 
+              boxShadow: "0 4px 12px rgba(16, 185, 129, 0.2)",
+              display: "flex",
+              alignItems: "center",
+              gap: 12
+            }}>
+              <div style={{ fontSize: 24 }}>✉️</div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 800, fontSize: 13 }}>Lời mời vào nhóm!</div>
+                <div style={{ fontSize: 11, opacity: 0.9 }}>
+                  <b>{inv.inviterName}</b> mời bạn vào <b>{inv.groupName}</b>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button 
+                  onClick={() => acceptInvitation(inv)}
+                  style={{ background: "#fff", color: "#059669", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 11, fontWeight: 800, cursor: "pointer" }}
+                >
+                  Chấp nhận
+                </button>
+                <button 
+                   onClick={() => declineInvitation(inv)}
+                  style={{ background: "rgba(255,255,255,0.2)", color: "#fff", border: "none", borderRadius: 8, padding: "6px 10px", fontSize: 11, fontWeight: 800, cursor: "pointer" }}
+                >
+                  Bỏ qua
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       <div style={{flex:1,overflowY:"auto",paddingBottom:70}}>
         {tab==="groups"&& (
-          <GroupsListView groups={groups} friends={friends} onSelectGroup={selectGroup} onCreateGroup={createGroup}/>
+          <GroupsListView groups={groups} friends={friends} onSelectGroup={selectGroup} onCreateGroup={createGroup} currency={profile?.currency || "đ"}/>
         )}
         {tab==="active"&&activeGroup&&(
           <GroupView group={groups.find(g=>g.id===activeGroup.id)||activeGroup} friends={friends} profile={profile} onUpdate={updateGroup} onDelete={()=>deleteGroup(activeGroup)} onLeave={()=>leaveGroup(activeGroup)} onBack={() => setTab("groups")} sendInviteEmail={sendInviteEmail}/>
         )}
-        {tab==="friends"&&<FriendsView friends={friends} groups={groups} onAddFriend={addFriend} onRemoveFriend={removeFriend} onPayClick={(g) => selectGroup(g)}/>}
-        {tab==="qr" && <ReceiptScannerView groups={groups} onAddExpense={addExpenseToGroup} />}
+        {tab==="friends"&&<FriendsView friends={friends} groups={groups} onAddFriend={addFriend} onRemoveFriend={removeFriend} onPayClick={(g) => selectGroup(g)} currency={profile?.currency || "đ"}/>}
+        {tab==="qr" && <ReceiptScannerView groups={groups} onAddExpense={addExpenseToGroup} currency={profile?.currency || "đ"} />}
         {tab==="settings" && (
           <div style={{padding:14}}>
             {/* Account Settings */}
@@ -3063,25 +3214,65 @@ export default function App() {
               </div>
             </Card>
 
-            {/* Sở thích & Thông báo */}
+            {/* Sở thích */}
             <Card>
-               <SecTitle icon="⚙️" title="Sở thích & Thông báo" color="#059669"/>
+               <SecTitle icon="⚙️" title="Sở thích" color="#059669"/>
                
                <div style={{marginBottom:10}}>
                  <div 
                    onClick={() => setShowSecurityModal(true)} 
                    style={{display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", padding: "10px 0"}}
                  >
-                   <div style={{fontSize:12, fontWeight:700, color:"#64748b", textTransform:"uppercase", letterSpacing:1}}>Bảo mật</div>
+                   <div style={{display: "flex", alignItems: "center", gap: 8}}>
+                      <span style={{fontSize: 16}}>🔒</span>
+                      <div style={{fontSize:13, fontWeight:700, color:"#0b565e"}}>Bảo mật & Tài khoản</div>
+                   </div>
+                   <span style={{fontSize: 18, color: "#94a3b8"}}>›</span>
                  </div>
                </div>
 
                <div>
-                 <div 
-                   onClick={() => setShowEmailSettings(true)} 
-                   style={{display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", padding: "10px 0"}}
-                 >
-                   <div style={{fontSize:12, fontWeight:700, color:"#64748b", textTransform:"uppercase", letterSpacing:1}}>Thông báo Email</div>
+                 <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0"}}>
+                   <div style={{display: "flex", alignItems: "center", gap: 8}}>
+                      <span style={{fontSize: 16}}>💰</span>
+                      <div style={{fontSize:13, fontWeight:700, color:"#0b565e"}}>Đơn vị tiền tệ</div>
+                   </div>
+                   <select 
+                     value={profile?.currency || "đ"} 
+                     onChange={(e) => updateProfile({ currency: e.target.value })}
+                     style={{
+                       background: "#f1f5f9",
+                       border: "none",
+                       borderRadius: 8,
+                       padding: "6px 10px",
+                       fontSize: 12,
+                       fontWeight: 700,
+                       color: "#0b565e",
+                       cursor: "pointer"
+                     }}
+                   >
+                     <option value="đ">VNĐ (đ)</option>
+                     <option value="$">USD ($)</option>
+                     <option value="€">EUR (€)</option>
+                     <option value="¥">JPY (¥)</option>
+                     <option value="£">GBP (£)</option>
+                     <option value="₩">KRW (₩)</option>
+                     <option value="元">CNY (元)</option>
+                     <option value="S$">SGD (S$)</option>
+                     <option value="฿">THB (฿)</option>
+                     <option value="A$">AUD (A$)</option>
+                     <option value="C$">CAD (C$)</option>
+                     <option value="CHF">CHF (Fr)</option>
+                     <option value="HK$">HKD (HK$)</option>
+                     <option value="NT$">TWD (NT$)</option>
+                     <option value="RM">MYR (RM)</option>
+                     <option value="Rp">IDR (Rp)</option>
+                     <option value="₱">PHP (₱)</option>
+                     <option value="₹">INR (₹)</option>
+                     <option value="₽">RUB (₽)</option>
+                     <option value="R$">BRL (R$)</option>
+                     <option value="ZAR">ZAR (R)</option>
+                   </select>
                  </div>
                </div>
             </Card>
@@ -3112,7 +3303,7 @@ export default function App() {
                  </div>
                </div>
                <Btn style={{ width: "100%", background: "linear-gradient(135deg, #f59e0b, #d97706)", color: "#fff", display: "flex", justifyContent: "center", alignItems: "center", padding: "14px", border: "none", borderRadius: 12, fontWeight: 800, fontSize: 14, boxShadow: "0 4px 14px rgba(245, 158, 11, 0.3)", letterSpacing: 0.5 }} onClick={() => {}}>
-                 Thanh toán (499.000 đ)
+                 Thanh toán ({fmt(499000, profile?.currency || "đ")})
                </Btn>
             </Card>
 

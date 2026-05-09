@@ -28,11 +28,9 @@
     "react-dom": "^19.0.1",
     "react-qr-code": "^2.0.21",
     "recharts": "^3.8.1",
-    "resend": "^6.12.3",
     "tsx": "^4.21.0"
   },
   "devDependencies": {
-    "@netlify/functions": "^5.2.0",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/nodemailer": "^8.0.0",

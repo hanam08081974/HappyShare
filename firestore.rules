@@ -72,7 +72,24 @@ service cloud.firestore {
             && data.ts is number;
     }
 
+    function isValidInvitation(data) {
+      return data.keys().hasAll(['groupId', 'groupName', 'inviterName', 'inviteCode', 'email', 'status', 'createdAt'])
+        && data.groupId is string
+        && data.groupName is string
+        && data.inviterName is string
+        && data.inviteCode is string
+        && data.email is string
+        && data.status in ['pending', 'accepted', 'declined']
+        && data.createdAt is string;
+    }
+
     // ─── MATCH BLOCKS ───────────────────────────────────────────
+
+    match /groupInvitations/{invitationId} {
+      allow list, get: if isSignedIn() && (resource.data.email == request.auth.token.email);
+      allow create: if isSignedIn() && isValidInvitation(incoming());
+      allow update, delete: if isSignedIn() && (resource.data.email == request.auth.token.email);
+    }
 
     match /users/{userId} {
       allow get, list: if isSignedIn();
@@ -80,7 +97,7 @@ service cloud.firestore {
       allow update: if isVerified() && request.auth.uid == userId && isValidUser(incoming())
                        && incoming().uid == existing().uid // Immutable UID
                        && (
-                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'photoURL', 'prefs', 'avatar'])
+                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'photoURL', 'prefs', 'avatar', 'currency'])
                        );
       allow delete: if isVerified() && request.auth.uid == userId;
       

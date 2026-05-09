@@ -1,5 +1,5 @@
 import express from "express";
-import { Resend } from "resend";
+import nodemailer from "nodemailer";
 import path from "path";
 import dotenv from "dotenv";
 import fs from "fs";
@@ -9,19 +9,29 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-// Resend setup
-let resendClient: Resend | null = null;
+// Transporter setup
+// Note: User needs to provide these in their environment settings
+// We use lazy initialization to prevent crash on startup if keys are missing
+let transporter: nodemailer.Transporter | null = null;
 
-function getResend() {
-  if (!resendClient) {
-    const apiKey = process.env.RESEND_API_KEY;
-    if (!apiKey) {
-      console.warn("RESEND_API_KEY not set. Email invitations will not be sent.");
+function getTransporter() {
+  if (!transporter) {
+    const user = process.env.SMTP_USER;
+    const pass = process.env.SMTP_PASS;
+    
+    if (!user || !pass) {
+      console.warn("SMTP_USER or SMTP_PASS not set. Email invitations will not be sent.");
       return null;
     }
-    resendClient = new Resend(apiKey);
+
+    transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || "smtp.gmail.com",
+      port: parseInt(process.env.SMTP_PORT || "587"),
+      secure: process.env.SMTP_SECURE === "true",
+      auth: { user, pass },
+    });
   }
-  return resendClient;
+  return transporter;
 }
 
 app.post("/api/invite", async (req, res) => {
@@ -31,14 +41,14 @@ app.post("/api/invite", async (req, res) => {
     return res.status(400).json({ error: "Missing email or inviteLink" });
   }
 
-  const resend = getResend();
-  if (!resend) {
-    return res.status(503).json({ error: "Email service not configured. Please set RESEND_API_KEY." });
+  const mailTransporter = getTransporter();
+  if (!mailTransporter) {
+    return res.status(503).json({ error: "Email service not configured. Please set SMTP_USER and SMTP_PASS." });
   }
 
   try {
-    const { data, error } = await resend.emails.send({
-      from: "HappyShare <onboarding@resend.dev>", // Default for testing, user should use their own domain later
+    const mailOptions = {
+      from: `"HappyShare" <${process.env.SMTP_USER}>`,
       to: email,
       subject: `[HappyShare] ${inviterName} mời bạn tham gia nhóm ${groupName || ""}`,
       html: `
@@ -64,14 +74,10 @@ app.post("/api/invite", async (req, res) => {
           </div>
         </div>
       `,
-    });
+    };
 
-    if (error) {
-      console.error("Resend error:", error);
-      return res.status(500).json({ error: error.message });
-    }
-
-    res.json({ success: true, data });
+    await mailTransporter.sendMail(mailOptions);
+    res.json({ success: true });
   } catch (err) {
     console.error("Email sending error:", err);
     res.status(500).json({ error: "Failed to send email" });
